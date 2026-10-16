@@ -43,7 +43,10 @@ const HARNESS_INSTRUCTION = [
   "Read the source only when nothing here covers the question, or when the code may have changed since the fact was recorded.",
   "Each line starts with its 8-character ref. When an entry is wrong or no longer holds, UPDATE it by that ref or DELETE it — never record a second entry beside it. Two entries that disagree are worse than one that is stale.",
   "Record durable facts with `harness_refine` in the same turn the operator states them — a preference, a correction, a constraint, a reusable tactic. Do not wait for `/refine` or for compaction: what stays only in the conversation is lost when the history is condensed.",
-  "Scope each one: workspace for a rule about this codebase, session for this conversation.",
+  /* The model does not choose a layer. It guessed badly when it did — a real
+   * session split one sentence across both layers — and the choice belongs to the
+   * operator anyway, who can see which memory they are looking at. */
+  "You do not choose where a fact is stored; the operator does, and the line below says which layer is currently selected. You always READ both layers. You only WRITE to the selected one.",
 ].join(" ");
 const TOP_K = 12;
 const CHAR_BUDGET = 4000;
@@ -352,9 +355,17 @@ function entryDate(createdAt) {
   try { return new Date(at).toISOString().slice(0, 10); } catch { return ""; }
 }
 
+/* What the operator's selection means, in the model's terms. */
+const SCOPE_OUTCOME = {
+  session: "this conversation only — a new chat will not see it",
+  workspace: "this workspace — every chat in this folder sees it",
+};
+
 export function render(entries, agent, extra) {
   const cfg = loadConfig();
-  const out = ["## Continual harness (prime)", "", HARNESS_INSTRUCTION];
+  const target = "New entries are saved to the " + cfg.defaultScope + " layer (" +
+    (SCOPE_OUTCOME[cfg.defaultScope] || SCOPE_OUTCOME.session) + ").";
+  const out = ["## Continual harness (prime)", "", HARNESS_INSTRUCTION, target];
   const picked = promptOrder(entries).slice(0, cfg.topK).filter((e) => e && e.text);
   let used = 0;
   const lines = [];
@@ -588,7 +599,7 @@ function refinementPrompt(lead) {
     lead,
     "Decide first whether this conversation holds anything durable at all: an operator preference, a correction, a constraint, or a decision and its reason. Nothing is a normal answer — if the conversation was routine, say so and stop.",
     "Also sweep for durable facts that were never recorded, not only this decision's outcome.",
-    "If something is durable, make every edit in ONE call to `" + TOOL_NAME + "`. Each edit carries its own scope and the evidence that prompted it; an edit without evidence is refused.",
+    "If something is durable, make every edit in ONE call to `" + TOOL_NAME + "`. Each edit carries the evidence that prompted it; an edit without evidence is refused. Do not pass a scope — the operator selected the layer.",
     "If an entry is now wrong, UPDATE it by its ref, or DELETE it. Do not add a second entry beside it: two entries that disagree are worse than one that is stale.",
     "Prefer no edit over a speculative one, and do not restate anything already in the harness.",
     "Do not narrate this pass: reply with one line saying what you changed, or that nothing was durable.",
@@ -789,7 +800,13 @@ function handleApi(ctx, req, res) {
      * listing an unrelated folder's entries. */
     const active = resolveActiveSession(ctx);
     const agent = active === null ? null : { session: { id: active.id, header: { cwd: active.cwd } } };
-    const withActive = (payload) => Object.assign({ active }, payload);
+    /* How many entries sit in EVERY layer, not just the one being listed. The panel
+     * shows one layer at a time while the agent reads all of them, so without this
+     * nothing on screen reveals that a second store holds anything — and an entry
+     * the operator cannot see is one they will report as lost. */
+    const counts = {};
+    for (const layer of SCOPES) counts[layer] = agent === null ? 0 : load(layer, agent).length;
+    const withActive = (payload) => Object.assign({ active, counts }, payload);
     switch (req2.op) {
       case "get": {
         /* With no session to key by, reading `session-default` would report whatever
@@ -807,6 +824,7 @@ function handleApi(ctx, req, res) {
         /* The operator typing it into the panel IS the evidence, so record that
          * rather than leaving the field absent on entries that have one. */
         const r = upsert(scope, agent, req2.text, "ui", req2.evidence || "added from the settings panel");
+        counts[scope] = load(scope, agent).length;
         return sendJson(res, r.ok ? 200 : 400, withActive(Object.assign({ ok: r.ok }, r, { entries: load(scope, agent) })));
       }
       case "remove": {

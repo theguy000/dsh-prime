@@ -96,7 +96,7 @@ assert.deepEqual(unresolvable, [], `unresolvable rows:\n${unresolvable.join("\n"
 	const agent = { session: { id: "s", header: { cwd: "C:/work/p" }, deriveMessages: () => [] } };
 	const args = {
 		findings: [
-			{ action: "add", text: "a durable finding", evidence: "the operator said so", scope: "workspace" },
+			{ action: "add", text: "a durable finding", evidence: "the operator said so" },
 			{ action: "delete", ref: "abc12345", evidence: "removing a stale entry" },
 		],
 	};
@@ -107,7 +107,9 @@ assert.deepEqual(unresolvable, [], `unresolvable rows:\n${unresolvable.join("\n"
 	 * subset and are enforced in execute() — covered in self-check.mjs. */
 	assert.ok(validateJsonSchemaValue(tool.parameters, { findings: [{ text: "x" }] }, "").length > 0, "an edit without action and evidence must be rejected");
 	assert.ok(validateJsonSchemaValue(tool.parameters, { findings: [{ action: "upsert", text: "x", evidence: "y" }] }, "").length > 0, "an out-of-enum action must be rejected");
-	assert.ok(validateJsonSchemaValue(tool.parameters, { findings: [{ action: "add", text: "x", evidence: "y", scope: "galaxy" }] }, "").length > 0, "an out-of-enum scope must be rejected");
+	/* No scope property exists at all: the operator selects the layer and the model
+	 * cannot name one. `additionalProperties: false` is what enforces that. */
+	assert.ok(validateJsonSchemaValue(tool.parameters, { findings: [{ action: "add", text: "x", evidence: "y", scope: "workspace" }] }, "").length > 0, "a model-supplied scope must be rejected");
 
 	const value = tool.execute(args, { agent });
 	assert.deepEqual(validateJsonSchemaValue(tool.output.schema, value, "value"), [], "the returned value must satisfy its own output schema");

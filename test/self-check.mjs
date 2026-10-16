@@ -359,10 +359,21 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 	assert.equal(tool.output.schema.type, "object");
 	assert.equal(tool.parameters.type, "object");
 	assert.deepEqual(tool.parameters.required, ["findings"], "one call carries the whole pass");
-	assert.deepEqual(tool.parameters.properties.findings.items.properties.scope.enum, ["session", "workspace"]);
-	/* The prompt and the tool must advertise the same layers the host writes. */
-	assert.match(section.text({ agent }), /workspace for a rule about this codebase/);
-	assert.ok(!/\bglobal\b/.test(section.text({ agent })), "the removed layer is not advertised to the model");
+	/* The model cannot choose a layer. It guessed badly when it could — a real
+	 * session split one sentence across both — and the choice belongs to the
+	 * operator, who can see which memory they are looking at. */
+	assert.equal(
+		tool.parameters.properties.findings.items.properties.scope,
+		undefined,
+		"the tool must not offer a scope: the operator selects the layer",
+	);
+	const guidance = section.text({ agent });
+	assert.match(guidance, /You do not choose where a fact is stored/);
+	assert.match(guidance, /You always READ both layers/);
+	/* And every rendering names the layer currently selected, or the model cannot
+	 * report where a fact went. */
+	assert.match(guidance, /New entries are saved to the (session|workspace) layer/);
+	assert.ok(!/\bglobal\b/.test(guidance), "the removed layer is not advertised to the model");
 
 	/** @returns the tool result for one batch, through the real execute(). */
 	const run = (findings) => tool.execute({ findings }, { agent });
@@ -372,9 +383,9 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 	/* One call carries the whole pass, and a duplicate inside the batch is
 	 * reported per finding rather than dropping or throwing the batch. */
 	const out = run([
-			ev("the probe records an entry", { scope: "workspace" }),
-			ev("a second finding rides the same call", { scope: "session" }),
-			ev("the probe records an entry", { scope: "workspace" }),
+			ev("the probe records an entry"),
+			ev("a second finding rides the same call"),
+			ev("the probe records an entry"),
 		]);
 	assert.equal(out.recorded, 2, "both distinct findings are written by one call");
 	assert.equal(out.skipped, 1, "the duplicate is counted, not silently dropped");
@@ -389,7 +400,7 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 	/* Every declared output field is present, so the return validates against its own schema. */
 	assert.deepEqual(Object.keys(out).sort(), Object.keys(tool.output.schema.properties).sort());
 
-	const allDup = run([ev("the probe records an entry", { scope: "workspace" })]);
+	const allDup = run([ev("the probe records an entry")]);
 	assert.equal(allDup.recorded, 0);
 	assert.equal(allDup.skipped, 1);
 	/* A missing scope falls back to the configured default, per finding. */
@@ -417,11 +428,23 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 	/* The fix for a store holding two entries that contradict each other: correct
 	 * the entry that is wrong instead of adding a third. */
 	{
-		const { load: loadStore, entryRef } = await import("../index.js");
+		const { load: loadStore, entryRef, saveConfig: setScope } = await import("../index.js");
 		const fresh = { session: { id: "edit-1", header: { cwd: "C:/work/edit" }, deriveMessages: () => [] } };
 		const scoped = (findings) => tool.execute({ findings }, { agent: fresh });
 
-		scoped([{ action: "add", text: "the pool switch sits below the tab section", evidence: "operator", scope: "workspace" }]);
+		/* The operator selects the layer; the tool no longer asks the model. */
+		setScope({ defaultScope: "workspace" });
+		/* A finding that names a layer anyway must be ignored, not honoured. Without
+		 * this the suite cannot tell the two behaviours apart: nothing else in it
+		 * passes a scope, so a build that let the model choose would pass too. */
+		{
+			/* Its own folder, so this probe cannot be confused with the block below. */
+			const sneaky = { session: { id: "edit-sneak", header: { cwd: "C:/work/sneak" }, deriveMessages: () => [] } };
+			tool.execute({ findings: [{ action: "add", text: "a model-chosen layer", evidence: "x", scope: "session" }] }, { agent: sneaky });
+			assert.equal(loadStore("session", sneaky).length, 0, "the model cannot write to the other layer by naming it");
+			assert.equal(loadStore("workspace", sneaky).length, 1, "it goes to the operator's selected layer instead");
+		}
+		scoped([{ action: "add", text: "the pool switch sits below the tab section", evidence: "operator" }]);
 		const stored = loadStore("workspace", fresh);
 		assert.equal(stored.length, 1);
 		const ref = entryRef(stored[0]);
@@ -432,7 +455,7 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 		assert.ok(section.text({ agent: fresh }).includes(ref), "the section renders the ref the tool accepts");
 
 		/* Update: same entry, corrected, with its history intact. */
-		const upd = scoped([{ action: "update", ref, text: "the pool switch sits inside the client view", evidence: "operator corrected it", scope: "workspace" }]);
+		const upd = scoped([{ action: "update", ref, text: "the pool switch sits inside the client view", evidence: "operator corrected it" }]);
 		assert.equal(upd.updated, 1);
 		const after = loadStore("workspace", fresh);
 		assert.equal(after.length, 1, "an update corrects in place rather than appending");
@@ -443,27 +466,30 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 		assert.equal(after[0].evidence, "operator corrected it");
 
 		/* A full id works too, so a caller that pasted the long form is not punished. */
-		assert.equal(scoped([{ action: "update", ref: stored[0].id, text: "by full id", evidence: "x", scope: "workspace" }]).updated, 1);
+		assert.equal(scoped([{ action: "update", ref: stored[0].id, text: "by full id", evidence: "x" }]).updated, 1);
 
 		/* An unknown ref is refused, never silently turned into an append. */
-		const missing = scoped([{ action: "delete", ref: "deadbeef", scope: "workspace" }]);
+		const missing = scoped([{ action: "delete", ref: "deadbeef" }]);
 		assert.equal(missing.deleted, 0);
 		assert.match(missing.text, /no entry with ref/);
 		assert.equal(loadStore("workspace", fresh).length, 1, "a failed edit changes nothing");
 
 		/* Update still refuses to duplicate another entry's text. */
-		scoped([{ action: "add", text: "a different fact", evidence: "operator", scope: "workspace" }]);
-		const clash = scoped([{ action: "update", ref, text: "a different fact", evidence: "x", scope: "workspace" }]);
+		scoped([{ action: "add", text: "a different fact", evidence: "operator" }]);
+		const clash = scoped([{ action: "update", ref, text: "a different fact", evidence: "x" }]);
 		assert.equal(clash.updated, 0);
 		assert.match(clash.text, /already says that/);
 
 		/* Delete takes exactly the named entry. */
-		assert.equal(scoped([{ action: "delete", ref, scope: "workspace" }]).deleted, 1);
+		assert.equal(scoped([{ action: "delete", ref }]).deleted, 1);
 		const left = loadStore("workspace", fresh);
 		assert.equal(left.length, 1);
 		assert.equal(left[0].text, "a different fact", "the wrong entry was not taken");
 		/* Delete needs no evidence: removing something is not a claim. */
-		assert.equal(scoped([{ action: "delete", ref: left[0].id.slice(0, 8), scope: "workspace" }]).deleted, 1);
+		assert.equal(scoped([{ action: "delete", ref: left[0].id.slice(0, 8) }]).deleted, 1);
+		/* Restore the layer this file started on, so later blocks are not reading a
+		 * setting this one changed. */
+		setScope({ defaultScope: "session" });
 		assert.equal(loadStore("workspace", fresh).length, 0);
 	}
 
@@ -506,6 +532,28 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 	assert.equal(got.json.config.defaultScope, "session");
 	assert.deepEqual(got.json.scopes, ["session", "workspace"]);
 	assert.ok(Array.isArray(got.json.entries) && Array.isArray(got.json.ranked), "get returns entries plus their ranking");
+
+	/* The panel lists one layer while the agent reads all of them, so every response
+	 * reports the count in each — otherwise an entry the operator cannot see reads as
+	 * an entry that was never recorded. */
+	{
+		/* Counts are compared against their own baseline: earlier blocks in this file
+		 * write to the same layers, so an absolute number would assert the fixture's
+		 * history rather than the behaviour. */
+		const beforeWs = (await invoke({ op: "get", scope: "workspace" })).json;
+		/* Assert the field itself first, so a missing one fails by name instead of
+		 * throwing a TypeError from the line below it. */
+		assert.ok(beforeWs.counts, "every response reports each layer's count");
+		assert.deepEqual(Object.keys(beforeWs.counts).sort(), ["session", "workspace"], "every layer is counted");
+		const wsBefore = beforeWs.counts.workspace;
+		const sessionBefore = beforeWs.counts.session;
+		await invoke({ op: "add", scope: "session", text: "a session-only note" });
+		const mixed = (await invoke({ op: "get", scope: "workspace" })).json;
+		assert.equal(mixed.scope, "workspace", "the listed layer is still the requested one");
+		assert.equal(mixed.counts.session, sessionBefore + 1, "the other layer's count follows its own store");
+		assert.equal(mixed.counts.workspace, wsBefore, "and this layer is untouched by a write to the other");
+		await invoke({ op: "clear", scope: "session" });
+	}
 
 	assert.equal((await invoke({ op: "add", scope: "workspace", text: "ui added note" })).status, 200);
 	assert.equal((await invoke({ op: "get", scope: "workspace" })).json.entries.length, 1);

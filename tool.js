@@ -53,6 +53,7 @@ const DESCRIPTION =
   "Send every edit of one pass in a SINGLE call — this tool takes an array — never one call per edit. " +
   "Every edit needs the evidence that prompted it: the operator's words, or what you observed. " +
   "When an entry is wrong or no longer holds, UPDATE it by its ref, or DELETE it. Never add a second entry beside a wrong one: two entries that disagree are worse than one that is stale. " +
+  "Do NOT pass a scope: the operator selects the memory layer, and the prompt section reports which one is active. " +
   "Prefer no edit over a speculative one, and never restate the current task or repeat what the harness already says.";
 
 /**
@@ -106,11 +107,6 @@ export function apply(ctx) {
                 type: "string",
                 description: "The 8-character ref shown at the start of the entry being updated or deleted.",
               },
-              scope: {
-                type: "string",
-                enum: SCOPES,
-                description: "How far it applies. session (default) = this conversation; workspace = every session in this working directory.",
-              },
               evidence: {
                 type: "string",
                 description: "What prompted this edit — the operator's words, or what you saw. Required for add and update; an entry that cannot cite its evidence does not belong in the harness.",
@@ -162,7 +158,10 @@ export function apply(ctx) {
       let updated = 0;
       let deleted = 0;
       for (const finding of findings) {
-        const scope = SCOPES.includes(finding.scope) ? finding.scope : fallback;
+        /* One layer, chosen by the operator. A finding that names a scope anyway is
+         * ignored rather than honoured: the model used to guess wrong, and the
+         * operator can see which memory they are looking at. */
+        const scope = fallback;
         const action = ACTIONS.includes(finding.action) ? finding.action : "add";
         const label = String(finding.text || finding.ref || "").slice(0, 56);
         /* The evidence rule is the gate. A finding that cannot say what prompted

@@ -119,7 +119,9 @@ back; over the cap nothing is written, so a rejected batch is never half-applied
 
 ### Scopes
 
-Two layers, selectable per call and in Settings → **Prime Harness**:
+Two layers. The operator selects one in Settings → **Prime Harness**, and **the
+agent never chooses**: everything it records goes to the selected layer. It always
+*reads* both.
 
 | Scope | Reach | Stored as |
 |---|---|---|

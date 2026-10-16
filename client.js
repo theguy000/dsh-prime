@@ -24,8 +24,8 @@ window.__ModuleLoader__.load({
 		/* Two layers, matching the host: this conversation, and this folder. `global`
 		   is gone — one machine-wide bucket mixes every repository together. */
 		const SCOPES = [
-			{ value: "session", label: "This conversation", hint: "Recorded here, used here." },
-			{ value: "workspace", label: "This workspace", hint: "Shared with every chat in this folder." }
+			{ value: "session", label: "This conversation", hint: "You see this chat plus the workspace. New entries stay here — no other chat will see them." },
+			{ value: "workspace", label: "This workspace", hint: "New entries are shared with every chat in this folder." }
 		];
 
 		/* Only layout this page owns. Buttons, inputs, the switch, and the segmented
@@ -39,6 +39,8 @@ window.__ModuleLoader__.load({
 			".dp-input{flex:1}",
 			".dp-hint{opacity:.65;min-height:1.2em}",
 			".dp-target{opacity:.5;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;word-break:break-all}",
+			".dp-other{border:none;background:transparent;color:inherit;cursor:pointer;font:inherit;font-size:11px;opacity:.7;text-align:left;padding:0;text-decoration:underline}",
+			".dp-other:hover{opacity:1}",
 			".dp-row{display:flex;gap:8px;align-items:center}",
 			".dp-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;max-height:340px;overflow:auto}",
 			".dp-item{display:flex;gap:8px;align-items:center;padding:8px;border-radius:6px;border:1px solid var(--dsh-border,#444)}",
@@ -88,7 +90,7 @@ window.__ModuleLoader__.load({
 		function PrimeHarnessSection() {
 			/* `active` is the session/folder the host resolved for this panel. The page
 			   is global while the stores are not, so it has to say what it is showing. */
-			const [state, setState] = React.useState({ loading: true, error: "", cfg: null, scope: "session", entries: [], active: null });
+			const [state, setState] = React.useState({ loading: true, error: "", cfg: null, scope: "session", entries: [], active: null, counts: null });
 			const [draft, setDraft] = React.useState("");
 			const [busy, setBusy] = React.useState(false);
 			const [armed, setArmed] = React.useState(false);
@@ -103,7 +105,8 @@ window.__ModuleLoader__.load({
 						cfg: data.config,
 						scope: data.scope,
 						entries: orderEntries(data.entries, data.ranked),
-						active: data.active || null
+						active: data.active || null,
+						counts: data.counts || null
 					});
 				} catch (error) {
 					setState((s) => Object.assign({}, s, { loading: false, error: String((error && error.message) || error) }));
@@ -173,6 +176,8 @@ window.__ModuleLoader__.load({
 			}, []);
 
 			const current = SCOPES.filter((o) => o.value === state.scope)[0] || SCOPES[0];
+			const other = SCOPES.filter((o) => o.value !== state.scope)[0] || SCOPES[0];
+			const otherCount = state.counts ? (state.counts[other.value] || 0) : 0;
 			const cfg = state.cfg || {};
 			/* The stores are per-conversation and per-folder while this page is one page,
 			   so name the target outright: "nothing recorded" and "showing a different
@@ -251,7 +256,17 @@ window.__ModuleLoader__.load({
 					h("span", { className: "dp-label" }, "Scope"),
 					scopeControl,
 					h("span", { className: "dp-hint" }, current.hint),
-					h("span", { className: "dp-target", title: target }, target)
+					h("span", { className: "dp-target", title: target }, target),
+					/* The agent reads every layer while this page lists one. Saying what the
+					   other layer holds — and switching on click — is what stops an entry the
+					   operator cannot see from reading as an entry that was never recorded. */
+					otherCount > 0
+						? h("button", {
+							type: "button",
+							className: "dp-other",
+							onClick: () => onScope(other.value)
+						}, otherCount + (otherCount === 1 ? " entry" : " entries") + " in " + other.label.toLowerCase() + " \u2192")
+						: null
 				),
 				h(Switch, {
 					checked: cfg.autoRefineOnCompact !== false,
