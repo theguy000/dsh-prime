@@ -1,0 +1,31 @@
+{
+  "name": "dsh-prime",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Prime mode for DeepSeek Harness: a prime-agent-style self-improving agent preset plus the scoped Continual Harness (/refine) it is built around.",
+  "exports": {
+    ".": "./index.js",
+    "./tool": "./tool.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "check": "node test/self-check.mjs && node test/validate-patch.mjs && node test/scope-check.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "external": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  }
+}

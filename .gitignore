@@ -1,0 +1,6 @@
+# The profile links this package; a local install or a stray probe run must
+# never be committed.
+node_modules/
+*.log
+*.tmp
+.DS_Store
