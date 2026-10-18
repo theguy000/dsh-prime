@@ -22,10 +22,12 @@ function resolveDshAppDir() {
 	const unpackedApp = path.join(baseRes, "app", "dsh", "node_modules");
 	if (fs.existsSync(unpackedApp)) return unpackedApp;
 	const asarFile = path.join(baseRes, "app.asar");
-	if (fs.existsSync(asarFile)) {
-		const cacheRoot = path.join(os.tmpdir(), "dsh-prime-asar-cache-" + fs.statSync(asarFile).mtimeMs);
+	const withRawAsar = (fn) => { const p = process.noAsar; process.noAsar = true; try { return fn(); } finally { process.noAsar = p; } };
+	if (withRawAsar(() => fs.existsSync(asarFile))) {
+		const cacheRoot = path.join(os.tmpdir(), "dsh-prime-asar-cache-" + withRawAsar(() => fs.statSync(asarFile).mtimeMs));
 		const cachedNm = path.join(cacheRoot, "dsh", "node_modules");
 		if (fs.existsSync(path.join(cachedNm, "@deepseek-ai", "dsh-tools", "lib", "index.js"))) return cachedNm;
+		const prevNoAsar = process.noAsar; process.noAsar = true;
 		const fd = fs.openSync(asarFile, "r");
 		try {
 			const hdr = Buffer.alloc(16);
@@ -63,6 +65,7 @@ function resolveDshAppDir() {
 			}
 		} finally {
 			fs.closeSync(fd);
+			process.noAsar = prevNoAsar;
 		}
 	}
 	return unpackedApp;
@@ -361,7 +364,7 @@ assert.match(patch, /name: 'dsh-prime'/);
 /* Presentation is what makes this prime-agent's model rather than a native tool
  * loop: the agent writes code that calls tools. `mode: ptc` needs the
  * `ptcRuntime` service, so a deployment without it fails the whole preset. */
-assert.match(patch, /dsh-agent-tool-presentation[\s\S]{0,140}mode: ptc/, "the mode must present tools as PTC");
+assert.match(patch, /dsh-agent-tool-presentation[\s\S]{0,140}mode: native/, "the mode must present tools natively so python_repl is a first-class tool");
 for (const row of [
 	"@deepseek-ai/dsh-tool-pwsh-persistent",
 	"@deepseek-ai/dsh-tool-bash-persistent",

@@ -6,7 +6,7 @@ piece DSH does not ship out of the box: the **Continual Harness** and a
 **persistent per-session Python RLM REPL**.
 
 **Programmatic tool calling & persistent Python REPL.** The model works through
-code by default (`mode: ptc`) and has a stateful `python_repl` tool backed by a
+code by default (`python_repl` + `mode: native`) and has a stateful `python_repl` tool backed by a
 persistent per-session Python 3 process. Context lives in variables (`ctx`,
 `messages`, `goal`, `workspace`, `store`), top-level `await` is enabled, and
 subagents, harness state, and host tools are callable directly from Python

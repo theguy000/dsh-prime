@@ -50,7 +50,7 @@ const HARNESS_INSTRUCTION = [
    * session split one sentence across both layers — and the choice belongs to the
    * operator anyway, who can see which memory they are looking at. */
   "You do not choose where a fact is stored; the operator does, and the line below says which layer is currently selected. You always READ both layers. You only WRITE to the selected one.",
-  "For stateful RLM exploration, context-as-a-variable (`ctx`, `messages`, `store`), or programmatic Python subagent and harness orchestration (`rlm.spawn`, `rlm.list_subagents`, `rlm.send_message`, `agent_message.send`, `rlm.harness`, `tools.*`), call `await tools.python_repl({ code: '...' })` inside `run_code` (never write raw Python directly in `run_code`).",
+  "Your primary programmatic execution and orchestration environment is `python_repl` (a persistent per-session Python 3 RLM kernel). Prefer `python_repl` for multi-step inspection, programmatic tool calling (`await tools.<name>(**kwargs)`), context-as-a-variable (`ctx`, `messages`, `store`), and subagent/harness orchestration (`await rlm(task, name=..., role=...)`, `rlm.spawn`, `rlm.list_subagents`, `agent_message.send`, `rlm.harness`)."
 ].join(" ");
 const TOP_K = 12;
 const CHAR_BUDGET = 4000;
@@ -1593,6 +1593,16 @@ function handleApi(ctx, req, res) {
 /* ---------- plugin ---------- */
 
 
+function withRawAsar(fn) {
+  const prev = process.noAsar;
+  process.noAsar = true;
+  try {
+    return fn();
+  } finally {
+    process.noAsar = prev;
+  }
+}
+
 let windowsSandboxPatched = false;
 export function ensureWindowsSandboxRunner(ctx) {
   if (process.platform !== "win32") return false;
@@ -1605,55 +1615,58 @@ export function ensureWindowsSandboxRunner(ctx) {
       path.join(path.dirname(process.execPath), "resources"),
       path.join(localAppData, "Programs", "DeepSeek Harness", "resources"),
     ];
-    const baseRes = candidates.find((d) => fs.existsSync(path.join(d, "app.asar")));
+    const baseRes = withRawAsar(() => candidates.find((d) => fs.existsSync(path.join(d, "app.asar"))));
     if (!baseRes) return false;
     const dshNode = path.join(baseRes, "runtime", "primary-runtime", "dependencies", "node", "bin", "node.exe");
     const asarFile = path.join(baseRes, "app.asar");
-    if (!fs.existsSync(dshNode) || !fs.existsSync(asarFile)) return false;
+    if (!withRawAsar(() => fs.existsSync(dshNode) && fs.existsSync(asarFile))) return false;
     const realTmp = (process.env.LOCALAPPDATA && fs.existsSync(path.join(process.env.LOCALAPPDATA, "Temp")))
       ? path.join(process.env.LOCALAPPDATA, "Temp")
       : os.tmpdir();
-    const cacheRoot = path.join(realTmp, "dsh-prime-asar-cache-" + fs.statSync(asarFile).mtimeMs);
+    const asarMtime = withRawAsar(() => fs.statSync(asarFile).mtimeMs);
+    const cacheRoot = path.join(realTmp, "dsh-prime-asar-cache-" + asarMtime);
     const cachedNm = path.join(cacheRoot, "dsh", "node_modules");
     const runnerPath = path.join(cachedNm, "@deepseek-ai", "dsh-sandbox-windows-acl", "lib", "runner.js");
     if (!fs.existsSync(runnerPath)) {
-      const fd = fs.openSync(asarFile, "r");
-      try {
-        const hdr = Buffer.alloc(16);
-        fs.readSync(fd, hdr, 0, 16, 0);
-        const headerSize = hdr.readUInt32LE(4), jsonSize = hdr.readUInt32LE(12);
-        const jsonBuf = Buffer.alloc(jsonSize);
-        fs.readSync(fd, jsonBuf, 0, jsonSize, 16);
-        const tree = JSON.parse(jsonBuf.toString("utf8"));
-        const dataBase = 8 + headerSize;
-        const nmNode = tree?.files?.dsh?.files?.node_modules;
-        if (nmNode?.files) {
-          const extractNode = (node, relPath) => {
-            if (node.files) {
-              for (const [k, child] of Object.entries(node.files)) {
-                if (k === ".bin" || /\.(node|wasm|dll|exe)$/i.test(k)) continue;
-                extractNode(child, path.join(relPath, k));
+      withRawAsar(() => {
+        const fd = fs.openSync(asarFile, "r");
+        try {
+          const hdr = Buffer.alloc(16);
+          fs.readSync(fd, hdr, 0, 16, 0);
+          const headerSize = hdr.readUInt32LE(4), jsonSize = hdr.readUInt32LE(12);
+          const jsonBuf = Buffer.alloc(jsonSize);
+          fs.readSync(fd, jsonBuf, 0, jsonSize, 16);
+          const tree = JSON.parse(jsonBuf.toString("utf8"));
+          const dataBase = 8 + headerSize;
+          const nmNode = tree?.files?.dsh?.files?.node_modules;
+          if (nmNode?.files) {
+            const extractNode = (node, relPath) => {
+              if (node.files) {
+                for (const [k, child] of Object.entries(node.files)) {
+                  if (k === ".bin" || /\.(node|wasm|dll|exe)$/i.test(k)) continue;
+                  extractNode(child, path.join(relPath, k));
+                }
+                return;
               }
-              return;
-            }
-            if (!/\.(c?js|mjs|json)$/i.test(relPath)) return;
-            const dest = path.join(cachedNm, relPath);
-            fs.mkdirSync(path.dirname(dest), { recursive: true });
-            if (node.unpacked) {
-              const src = path.join(baseRes, "app.asar.unpacked", "dsh", "node_modules", relPath);
-              if (fs.existsSync(src)) fs.copyFileSync(src, dest);
-              return;
-            }
-            const size = Number(node.size || 0), offset = dataBase + Number(node.offset || 0);
-            const buf = Buffer.alloc(size);
-            fs.readSync(fd, buf, 0, size, offset);
-            fs.writeFileSync(dest, buf);
-          };
-          extractNode(nmNode, "");
+              if (!/\.(c?js|mjs|json)$/i.test(relPath)) return;
+              const dest = path.join(cachedNm, relPath);
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              if (node.unpacked) {
+                const src = path.join(baseRes, "app.asar.unpacked", "dsh", "node_modules", relPath);
+                if (fs.existsSync(src)) fs.copyFileSync(src, dest);
+                return;
+              }
+              const size = Number(node.size || 0), offset = dataBase + Number(node.offset || 0);
+              const buf = Buffer.alloc(size);
+              fs.readSync(fd, buf, 0, size, offset);
+              fs.writeFileSync(dest, buf);
+            };
+            extractNode(nmNode, "");
+          }
+        } finally {
+          fs.closeSync(fd);
         }
-      } finally {
-        fs.closeSync(fd);
-      }
+      });
     }
     const unpackedNm = path.join(baseRes, "app.asar.unpacked", "dsh", "node_modules");
     for (const mod of ["@koromix", "koffi"]) {
@@ -1666,7 +1679,8 @@ export function ensureWindowsSandboxRunner(ctx) {
     sandbox.internals.windowsAclRunnerArgs = [dshNode, runnerPath];
     windowsSandboxPatched = true;
     return true;
-  } catch {
+  } catch (err) {
+    try { ctx?.logger?.warn?.("[dsh-prime] ensureWindowsSandboxRunner failed: " + (err?.message || err)); } catch {}
     return false;
   }
 }

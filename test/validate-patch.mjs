@@ -24,8 +24,9 @@ function resolveDshAppDir() {
 	const unpackedApp = path.join(baseRes, "app", "dsh", "node_modules");
 	if (fs.existsSync(unpackedApp)) return unpackedApp;
 	const asarFile = path.join(baseRes, "app.asar");
-	if (fs.existsSync(asarFile)) {
-		const cacheRoot = path.join(os.tmpdir(), "dsh-prime-asar-cache-" + fs.statSync(asarFile).mtimeMs);
+	const withRawAsar = (fn) => { const p = process.noAsar; process.noAsar = true; try { return fn(); } finally { process.noAsar = p; } };
+	if (withRawAsar(() => fs.existsSync(asarFile))) {
+		const cacheRoot = path.join(os.tmpdir(), "dsh-prime-asar-cache-" + withRawAsar(() => fs.statSync(asarFile).mtimeMs));
 		const cachedNm = path.join(cacheRoot, "dsh", "node_modules");
 		if (fs.existsSync(path.join(cachedNm, "@deepseek-ai", "dsh-tools", "lib", "index.js"))) return cachedNm;
 	}
