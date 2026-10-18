@@ -810,5 +810,22 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 	resetPythonRepl(replAgent);
 }
 
+
+{
+const { ensurePrimeFullAccess } = await import("../index.js");
+const appended = [];
+const mkSess = (id, preset) => ({
+id,
+header: preset ? { agentPreset: preset } : {},
+append: (type, data) => void appended.push({ id, type, data }),
+});
+const fakeCtx = { get: () => undefined };
+assert.equal(ensurePrimeFullAccess(fakeCtx, mkSess("std-1", "standard"), null), false, "standard preset stays in default workspace-write");
+assert.equal(appended.length, 0);
+assert.equal(ensurePrimeFullAccess(fakeCtx, mkSess("prime-1", "prime"), null), true, "prime preset auto-promotes to danger-full-access");
+assert.equal(appended.some((e) => e.id === "prime-1" && e.type === "sandbox/mode" && e.data.mode === "danger-full-access"), true);
+assert.equal(ensurePrimeFullAccess(fakeCtx, mkSess("prime-1", "prime"), null), false, "only promotes once per session so manual overrides stick");
+}
+
 fs.rmSync(temp, { recursive: true, force: true });
 console.log("dsh-prime self-check: ok");

@@ -1603,6 +1603,59 @@ function withRawAsar(fn) {
   }
 }
 
+const promotedFullAccessSessions = new Set();
+export function ensurePrimeFullAccess(ctx, session, event) {
+  if (!session || typeof session.id !== "string") return false;
+  if (event && event.type === "agent-preset/selected" && event.data) {
+    if (event.data.agentPreset !== PRESET_ID) {
+      if (promotedFullAccessSessions.has(session.id)) {
+        promotedFullAccessSessions.delete(session.id);
+        try {
+          const perms = (ctx && ctx.permissionPresets) || (ctx && ctx.get && ctx.get("permissionPresets"));
+          const fallbackPreset = (perms && perms.defaultPreset) || "workspace-write";
+          if (perms && typeof perms.set === "function") perms.set(session, fallbackPreset);
+          else if (typeof session.append === "function") {
+            session.append("permission/preset", { preset: fallbackPreset });
+            session.append("sandbox/mode", { mode: fallbackPreset === "danger-full-access" ? "danger-full-access" : "workspace-write" });
+          }
+        } catch {}
+      }
+      return false;
+    }
+  }
+  if (promotedFullAccessSessions.has(session.id)) return false;
+  let resolvedPreset = null;
+  if (event && event.type === "agent-preset/selected" && event.data) {
+    resolvedPreset = event.data.agentPreset;
+  } else if (session.header && session.header.agentPreset) {
+    resolvedPreset = session.header.agentPreset;
+  } else {
+    resolvedPreset = presetOf(ctx, null, session);
+    if (!resolvedPreset) {
+      try {
+        const presets = (ctx && ctx.agentPresets) || (ctx && ctx.get && ctx.get("agentPresets"));
+        if (presets && typeof presets.defaultId === "string") resolvedPreset = presets.defaultId;
+      } catch {}
+    }
+  }
+  if (resolvedPreset !== PRESET_ID) return false;
+  promotedFullAccessSessions.add(session.id);
+  try {
+    const perms = (ctx && ctx.permissionPresets) || (ctx && ctx.get && ctx.get("permissionPresets"));
+    if (perms && typeof perms.set === "function") {
+      perms.set(session, "danger-full-access");
+      return true;
+    }
+    if (typeof session.append === "function") {
+      session.append("permission/preset", { preset: "danger-full-access" });
+      session.append("sandbox/mode", { mode: "danger-full-access" });
+      session.append("approval/policy", { policy: "never" });
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
 let windowsSandboxPatched = false;
 export function ensureWindowsSandboxRunner(ctx) {
   if (process.platform !== "win32") return false;
@@ -1703,12 +1756,19 @@ export function apply(ctx, config) {
   /* Compaction survival: entries are on disk; this re-injects + offers auto-refine. */
   try { goalsApi = ctx.get ? ctx.get("goals") : null; } catch { goalsApi = null; }
 
+  ctx.on("session/created", (session) => {
+    Promise.resolve().then(() => {
+      try { ensurePrimeFullAccess(ctx, session, null); } catch {}
+    });
+  });
+
   ctx.on("session/event", (session, event) => {
     if (!session) return;
     /* Every event, before any filtering: this is what lets the settings panel
      * name the folder it is showing instead of guessing from the process cwd. */
     rememberSession(session);
     if (!windowsSandboxPatched) ensureWindowsSandboxRunner(ctx);
+    try { ensurePrimeFullAccess(ctx, session, event); } catch {}
     if (!event) return;
     /* The pass is over once its turn ends, which re-arms `/refine`. Re-arming on
      * `turn/start` would clear the slot before the pass had even run. */
