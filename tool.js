@@ -27,6 +27,7 @@ import {
   SECTION_NAME,
   SECTION_ORDER,
   TOOL_NAME,
+  ensureWindowsSandboxRunner,
   entryRef,
   evalPythonRepl,
   load,
@@ -70,6 +71,7 @@ const DESCRIPTION =
  * @param ctx - the preset's agent-scoped context, carrying the tool registry.
  */
 export function apply(ctx) {
+  ensureWindowsSandboxRunner(ctx);
   /* Scope-aware registration: this reaches only agents that joined the Prime
    * preset, which is why it lives here and not in the root half. `context` is
    * `{ agent, scope, signal }`, and the agent carries the live message list the

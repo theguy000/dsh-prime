@@ -1573,7 +1573,87 @@ function handleApi(ctx, req, res) {
 }
 /* ---------- plugin ---------- */
 
+
+let windowsSandboxPatched = false;
+export function ensureWindowsSandboxRunner(ctx) {
+  if (process.platform !== "win32") return false;
+  try {
+    const sandbox = (ctx && ctx.sandbox) || (ctx && ctx.get && ctx.get("sandbox"));
+    if (!sandbox || !sandbox.internals) return false;
+    if (Array.isArray(sandbox.internals.windowsAclRunnerArgs) && sandbox.internals.windowsAclRunnerArgs.length > 0) return true;
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    const candidates = [
+      path.join(path.dirname(process.execPath), "resources"),
+      path.join(localAppData, "Programs", "DeepSeek Harness", "resources"),
+    ];
+    const baseRes = candidates.find((d) => fs.existsSync(path.join(d, "app.asar")));
+    if (!baseRes) return false;
+    const dshNode = path.join(baseRes, "runtime", "primary-runtime", "dependencies", "node", "bin", "node.exe");
+    const asarFile = path.join(baseRes, "app.asar");
+    if (!fs.existsSync(dshNode) || !fs.existsSync(asarFile)) return false;
+    const realTmp = (process.env.LOCALAPPDATA && fs.existsSync(path.join(process.env.LOCALAPPDATA, "Temp")))
+      ? path.join(process.env.LOCALAPPDATA, "Temp")
+      : os.tmpdir();
+    const cacheRoot = path.join(realTmp, "dsh-prime-asar-cache-" + fs.statSync(asarFile).mtimeMs);
+    const cachedNm = path.join(cacheRoot, "dsh", "node_modules");
+    const runnerPath = path.join(cachedNm, "@deepseek-ai", "dsh-sandbox-windows-acl", "lib", "runner.js");
+    if (!fs.existsSync(runnerPath)) {
+      const fd = fs.openSync(asarFile, "r");
+      try {
+        const hdr = Buffer.alloc(16);
+        fs.readSync(fd, hdr, 0, 16, 0);
+        const headerSize = hdr.readUInt32LE(4), jsonSize = hdr.readUInt32LE(12);
+        const jsonBuf = Buffer.alloc(jsonSize);
+        fs.readSync(fd, jsonBuf, 0, jsonSize, 16);
+        const tree = JSON.parse(jsonBuf.toString("utf8"));
+        const dataBase = 8 + headerSize;
+        const nmNode = tree?.files?.dsh?.files?.node_modules;
+        if (nmNode?.files) {
+          const extractNode = (node, relPath) => {
+            if (node.files) {
+              for (const [k, child] of Object.entries(node.files)) {
+                if (k === ".bin" || /\.(node|wasm|dll|exe)$/i.test(k)) continue;
+                extractNode(child, path.join(relPath, k));
+              }
+              return;
+            }
+            if (!/\.(c?js|mjs|json)$/i.test(relPath)) return;
+            const dest = path.join(cachedNm, relPath);
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            if (node.unpacked) {
+              const src = path.join(baseRes, "app.asar.unpacked", "dsh", "node_modules", relPath);
+              if (fs.existsSync(src)) fs.copyFileSync(src, dest);
+              return;
+            }
+            const size = Number(node.size || 0), offset = dataBase + Number(node.offset || 0);
+            const buf = Buffer.alloc(size);
+            fs.readSync(fd, buf, 0, size, offset);
+            fs.writeFileSync(dest, buf);
+          };
+          extractNode(nmNode, "");
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+    const unpackedNm = path.join(baseRes, "app.asar.unpacked", "dsh", "node_modules");
+    for (const mod of ["@koromix", "koffi"]) {
+      const src = path.join(unpackedNm, mod), dst = path.join(cachedNm, mod);
+      if (fs.existsSync(src) && !fs.existsSync(dst)) {
+        try { fs.cpSync(src, dst, { recursive: true, force: true }); } catch {}
+      }
+    }
+    if (!fs.existsSync(runnerPath)) return false;
+    sandbox.internals.windowsAclRunnerArgs = [dshNode, runnerPath];
+    windowsSandboxPatched = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function apply(ctx, config) {
+  ensureWindowsSandboxRunner(ctx);
   const cfg = Object.assign(loadConfig(), config || {});
   if (SCOPES.includes(cfg.defaultScope)) saveConfig({ defaultScope: cfg.defaultScope });
 
@@ -1595,6 +1675,7 @@ export function apply(ctx, config) {
     /* Every event, before any filtering: this is what lets the settings panel
      * name the folder it is showing instead of guessing from the process cwd. */
     rememberSession(session);
+    if (!windowsSandboxPatched) ensureWindowsSandboxRunner(ctx);
     if (!event) return;
     /* The pass is over once its turn ends, which re-arms `/refine`. Re-arming on
      * `turn/start` would clear the slot before the pass had even run. */
@@ -1625,6 +1706,7 @@ export function apply(ctx, config) {
    * Measured, not assumed: a diagnostic printed `webServer=NULL` on every boot
    * while `/prime/api` answered 405 from the static fallback. */
   ctx.effect(() => {
+    ensureWindowsSandboxRunner(ctx);
     const server = ctx.webServer;
     if (!server || typeof server.register !== "function") {
       /* Reached only by a deployment with no host webserver at all. The settings
