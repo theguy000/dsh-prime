@@ -11,17 +11,63 @@ import { pathToFileURL } from "node:url";
 
 /* Same resolution as validate-patch.mjs, so the shared checks below import real
  * harness packages rather than fixtures. */
-const APP =
-	process.env.DSH_APP_DIR ??
-	path.join(
+function resolveDshAppDir() {
+	if (process.env.DSH_APP_DIR && fs.existsSync(process.env.DSH_APP_DIR)) return process.env.DSH_APP_DIR;
+	const baseRes = path.join(
 		process.env.LOCALAPPDATA ?? path.join(process.env.USERPROFILE ?? "", "AppData", "Local"),
 		"Programs",
 		"DeepSeek Harness",
 		"resources",
-		"app",
-		"dsh",
-		"node_modules",
 	);
+	const unpackedApp = path.join(baseRes, "app", "dsh", "node_modules");
+	if (fs.existsSync(unpackedApp)) return unpackedApp;
+	const asarFile = path.join(baseRes, "app.asar");
+	if (fs.existsSync(asarFile)) {
+		const cacheRoot = path.join(os.tmpdir(), "dsh-prime-asar-cache-" + fs.statSync(asarFile).mtimeMs);
+		const cachedNm = path.join(cacheRoot, "dsh", "node_modules");
+		if (fs.existsSync(path.join(cachedNm, "@deepseek-ai", "dsh-tools", "lib", "index.js"))) return cachedNm;
+		const fd = fs.openSync(asarFile, "r");
+		try {
+			const hdr = Buffer.alloc(16);
+			fs.readSync(fd, hdr, 0, 16, 0);
+			const headerSize = hdr.readUInt32LE(4), jsonSize = hdr.readUInt32LE(12);
+			const jsonBuf = Buffer.alloc(jsonSize);
+			fs.readSync(fd, jsonBuf, 0, jsonSize, 16);
+			const tree = JSON.parse(jsonBuf.toString("utf8"));
+			const dataBase = 8 + headerSize;
+			const nmNode = tree?.files?.dsh?.files?.node_modules;
+			if (nmNode?.files) {
+				const extractNode = (node, relPath) => {
+					if (node.files) {
+						for (const [k, child] of Object.entries(node.files)) {
+							if (k === ".bin" || /\.(node|wasm|dll|exe)$/i.test(k)) continue;
+							extractNode(child, path.join(relPath, k));
+						}
+						return;
+					}
+					if (!/\.(c?js|mjs|json)$/i.test(relPath)) return;
+					const dest = path.join(cachedNm, relPath);
+					fs.mkdirSync(path.dirname(dest), { recursive: true });
+					if (node.unpacked) {
+						const src = path.join(baseRes, "app.asar.unpacked", "dsh", "node_modules", relPath);
+						if (fs.existsSync(src)) fs.copyFileSync(src, dest);
+						return;
+					}
+					const size = Number(node.size || 0), offset = dataBase + Number(node.offset || 0);
+					const buf = Buffer.alloc(size);
+					fs.readSync(fd, buf, 0, size, offset);
+					fs.writeFileSync(dest, buf);
+				};
+				extractNode(nmNode, "");
+				return cachedNm;
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+	return unpackedApp;
+}
+const APP = resolveDshAppDir();
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-prime-check-"));
 process.env.DSH_HOME = temp;
@@ -81,9 +127,10 @@ applyTool({
   tools: { register: (definition) => void toolDefs.push(definition) },
   systemPrompt: { section: (definition) => void toolSections.push(definition) },
 });
-assert.equal(toolDefs.length, 1);
+assert.equal(toolDefs.length, 2, "the preset half registers harness_refine and python_repl");
 assert.equal(toolSections.length, 1, "the preset half owns the prompt section");
 const tool = toolDefs[0];
+const replTool = toolDefs[1];
 const section = toolSections[0];
 
 const agent = { session: { id: "s1", header: { cwd: "C:/work/proj" }, deriveMessages: () => [] } };
@@ -322,7 +369,7 @@ for (const row of [
 	"@deepseek-ai/dsh-workflow-ptc",
 	"@deepseek-ai/dsh-tool-workflow",
 	"@deepseek-ai/dsh-tool-ralph",
-	"@deepseek-ai/dsh-schedule",
+	"@deepseek-ai/dsh-tool-schedule",
 	"@deepseek-ai/dsh-time-context",
 	"@deepseek-ai/dsh-command-goal",
 ]) {
@@ -641,6 +688,123 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 	assert.equal((await panel({ op: "add", scope: "workspace", text: "workspace note from the panel" })).status, 200);
 	assert.equal(loadStore("workspace", realAgent).length, 1);
 	assert.equal(loadStore("workspace", { session: { header: { cwd: "C:/somewhere/else" } } }).length, 0, "and only that folder");
+}
+
+{
+	assert.equal(replTool.name, "python_repl");
+	assert.equal(typeof replTool.output.render, "function");
+	assert.deepEqual(replTool.parameters.required, ["code"]);
+
+	const spawnedCalls = [];
+	const sentMessages = [];
+	const interruptedIds = [];
+	const customToolCalls = [];
+	const replDefs = [];
+	const registeredSkillProviders = [];
+
+	applyTool({
+		tools: {
+			register: (d) => void replDefs.push(d),
+			execute: async (call) => {
+				customToolCalls.push(call);
+				return { isError: false, value: { echoed: call.arguments, tool: call.name } };
+			},
+		},
+		systemPrompt: { section: () => {} },
+		get: (svc) => {
+			if (svc === "subagents") {
+				return {
+					resolveMaxDepth: () => 2,
+					startActivation: async (spec) => {
+						spawnedCalls.push(spec);
+						return { childId: "sub-" + spawnedCalls.length };
+					},
+					listDescendants: async () => spawnedCalls.map((s, idx) => ({
+						id: "sub-" + (idx + 1), label: s.label, mode: "continuable", activity: "running", depth: 1,
+					})),
+					sendMessage: async (_sender, targetId, content) => {
+						sentMessages.push({ targetId, text: content[0].text });
+						return "msg-" + sentMessages.length;
+					},
+					interrupt: (targetId) => { interruptedIds.push(targetId); },
+				};
+			}
+			if (svc === "skills") {
+				return {
+					registerProvider: (factory) => {
+						registeredSkillProviders.push(factory({ invalidate: () => {} }));
+						return () => {};
+					},
+				};
+			}
+			return undefined;
+		},
+	});
+
+	assert.equal(registeredSkillProviders.length, 1);
+	const pyTool = replDefs.find((d) => d.name === "python_repl");
+	const refTool = replDefs.find((d) => d.name === "harness_refine");
+	const replAgent = {
+		session: {
+			id: "repl-s1",
+			header: { cwd: process.cwd(), parentSession: "parent-root-1" },
+			deriveMessages: () => [
+				{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "build the RLM persistent kernel" }] },
+				{ role: "assistant", source: { kind: "model" }, content: [{ type: "text", text: "working on the RLM kernel now" }] },
+			],
+		},
+	};
+
+	const r1 = await pyTool.execute({
+		code: "import asyncio\nawait asyncio.sleep(0.005)\ncounter = 41\ncounter + 1",
+		set_vars: { seeded_key: "alpha" },
+	}, { agent: replAgent });
+	assert.equal(r1.ok, true, "first python_repl eval succeeds: " + (r1.stderr || ""));
+	assert.equal(r1.result, 42);
+	assert.ok(r1.variables.includes("counter") && r1.variables.includes("seeded_key"));
+
+	const r2 = await pyTool.execute({
+		code: "counter += 8\nstore['saved'] = counter\n{'counter': counter, 'prev': _, 'has_ctx': 'RLM persistent kernel' in ctx, 'msg_count': len(messages), 'seeded': store.get('seeded_key')}",
+	}, { agent: replAgent });
+	assert.equal(r2.ok, true);
+	assert.deepEqual(r2.result, { counter: 49, prev: 42, has_ctx: true, msg_count: 2, seeded: "alpha" });
+
+	refTool.execute({
+		findings: [
+			{ action: "add", kind: "subagent", name: "auditor", text: "Check auth invariants carefully.", evidence: "operator defined auditor role" },
+			{ action: "add", kind: "skill", name: "lint-check", text: "Run linter before commit.", evidence: "operator workflow" },
+		],
+	}, { agent: replAgent });
+
+	const skillList = await registeredSkillProviders[0].list({ cwd: process.cwd(), scope: replAgent });
+	assert.ok(skillList.some((s) => s.name === "lint-check"));
+
+	const r3 = await pyTool.execute({
+		code: [
+			"h1 = await rlm('Audit login flow', name='audit-worker', role='auditor')",
+			"h2 = rlm.spawn('Forked check', name='fork-worker', fork=True)",
+			"subs = await rlm.list_subagents()",
+			"await agent_message.send('focus on token expiry', receiver_name='audit-worker')",
+			"await rlm.interrupt('fork-worker')",
+			"t_res = await tools.read_file(path='README.md')",
+			"h_add = await rlm.harness.add('Python REPL verified', evidence='self-check')",
+			"h_list = await rlm.harness.list()",
+			"{'h1': h1.id, 'h2': h2['id'], 'sub_count': len(subs), 'tool_echo': t_res['tool'], 'harness_count': len(h_list)}",
+		].join("\n"),
+	}, { agent: replAgent });
+	assert.equal(r3.ok, true, "RLM bridge succeeds: " + (r3.stderr || ""));
+	assert.equal(r3.result.h1, "sub-1");
+	assert.equal(r3.result.h2, "sub-2");
+	assert.equal(r3.result.sub_count, 2);
+	assert.equal(r3.result.tool_echo, "read_file");
+	assert.ok(r3.result.harness_count >= 3);
+	assert.match(spawnedCalls[0].request.prompt[0].text, /\[Subagent Role: auditor\]/);
+	assert.equal(spawnedCalls[1].provider, "fork");
+	assert.deepEqual(sentMessages[0], { targetId: "sub-1", text: "focus on token expiry" });
+	assert.deepEqual(interruptedIds, ["sub-2"]);
+
+	const { resetPythonRepl } = await import("../index.js");
+	resetPythonRepl(replAgent);
 }
 
 fs.rmSync(temp, { recursive: true, force: true });

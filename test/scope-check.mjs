@@ -163,5 +163,44 @@ assert.equal(m.loadConfig().defaultScope, "session", "a corrupt config falls bac
 assert.deepEqual(m.load("session", a), [], "a corrupt config leaves stores readable");
 assert.equal(m.render([], a).includes("harness_refine"), true, "and still renders the capture instruction");
 
+// --- snapshots, diff, rollback, pin, and 4 component kinds ---
+{
+	m.refine("session --clear", a);
+	m.refine("session first durable fact", a);
+	m.refine("session second durable fact", a);
+	assert.equal(m.load("session", a).length, 2);
+	assert.ok(m.loadSnapshots("session", a).length >= 2, "each mutation records a before/after snapshot");
+	assert.match(m.refine("session --snapshots", a).text, /snapshots \(session\):/);
+	assert.match(m.refine("session --diff", a).text, /\+ [0-9a-f]{8} second durable fact/);
+
+	const rb = m.refine("session --rollback", a);
+	assert.equal(rb.kind, "success");
+	assert.equal(m.load("session", a).length, 1);
+	assert.equal(m.load("session", a)[0].text, "first durable fact");
+
+	const rbUndo = m.refine("session --rollback", a);
+	assert.equal(rbUndo.kind, "success");
+	assert.equal(m.load("session", a).length, 2);
+
+	const ref0 = m.entryRef(m.load("session", a)[0]);
+	assert.equal(m.refine("session --pin " + ref0, a).kind, "success");
+	assert.equal(m.load("session", a)[0].pinned, true);
+	assert.equal(m.refine("session --unpin " + ref0, a).kind, "success");
+	assert.equal(Boolean(m.load("session", a)[0].pinned), false);
+	assert.equal(m.refine("session --edit " + ref0 + " first durable fact updated", a).kind, "success");
+	assert.equal(m.load("session", a)[0].text, "first durable fact updated");
+	assert.equal(m.refine("session --delete " + ref0, a).kind, "success");
+	assert.equal(m.load("session", a).length, 1);
+
+	m.upsert("session", a, "Always verify schemas before committing.", "tool", "operator rule", { kind: "prompt" });
+	m.upsert("session", a, "Run cargo check --workspace before tests.", "tool", "workflow", { kind: "skill", name: "cargo-verify" });
+	m.upsert("session", a, "Security reviewer focusing on auth boundaries.", "tool", "team", { kind: "subagent", name: "sec-reviewer" });
+	const renderedKinds = m.render(m.load("session", a), a);
+	assert.match(renderedKinds, /\[prompt\] Always verify schemas before committing\./);
+	assert.match(renderedKinds, /\[skill:cargo-verify\] Run cargo check --workspace before tests\./);
+	assert.match(renderedKinds, /\[subagent:sec-reviewer\] Security reviewer focusing on auth boundaries\./);
+	m.refine("session --clear", a);
+}
+
 console.log("ALL PRIME CHECKS PASSED");
 console.log("files:", fs.readdirSync(path.join(tmp, "prime")).sort().join(", "));

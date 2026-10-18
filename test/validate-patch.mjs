@@ -8,21 +8,30 @@
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-const APP =
-	process.env.DSH_APP_DIR ??
-	path.join(
+function resolveDshAppDir() {
+	if (process.env.DSH_APP_DIR && fs.existsSync(process.env.DSH_APP_DIR)) return process.env.DSH_APP_DIR;
+	const baseRes = path.join(
 		process.env.LOCALAPPDATA ?? path.join(process.env.USERPROFILE ?? "", "AppData", "Local"),
 		"Programs",
 		"DeepSeek Harness",
 		"resources",
-		"app",
-		"dsh",
-		"node_modules",
 	);
+	const unpackedApp = path.join(baseRes, "app", "dsh", "node_modules");
+	if (fs.existsSync(unpackedApp)) return unpackedApp;
+	const asarFile = path.join(baseRes, "app.asar");
+	if (fs.existsSync(asarFile)) {
+		const cacheRoot = path.join(os.tmpdir(), "dsh-prime-asar-cache-" + fs.statSync(asarFile).mtimeMs);
+		const cachedNm = path.join(cacheRoot, "dsh", "node_modules");
+		if (fs.existsSync(path.join(cachedNm, "@deepseek-ai", "dsh-tools", "lib", "index.js"))) return cachedNm;
+	}
+	return unpackedApp;
+}
+const APP = resolveDshAppDir();
 assert.ok(fs.existsSync(APP), `harness node_modules not found at ${APP}; set DSH_APP_DIR`);
 
 const yaml = createRequire(path.join(APP, "noop.cjs"))("js-yaml");
@@ -78,7 +87,6 @@ assert.deepEqual(unresolvable, [], `unresolvable rows:\n${unresolvable.join("\n"
 // resolve `@deepseek-ai/dsh-tools`. Run the real validators the registry uses, so
 // a hand-written schema cannot drift out of the supported subset unnoticed.
 {
-	const os = await import("node:os");
 	process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "prime-patch-"));
 	const { assertSupportedJsonSchema, validateJsonSchemaValue } = await import(pathToFileURL(path.join(APP, "@deepseek-ai", "dsh-tools", "lib", "index.js")).href);
 	const { apply } = await import("../tool.js");
@@ -92,6 +100,12 @@ assert.deepEqual(unresolvable, [], `unresolvable rows:\n${unresolvable.join("\n"
 	const tool = definitions[0];
 	assertSupportedJsonSchema(tool.parameters);
 	assertSupportedJsonSchema(tool.output.schema);
+	const replTool = definitions.find((d) => d.name === "python_repl");
+	assert.ok(replTool, "the preset half also registers python_repl");
+	assertSupportedJsonSchema(replTool.parameters);
+	assertSupportedJsonSchema(replTool.output.schema);
+	assert.deepEqual(validateJsonSchemaValue(replTool.parameters, { code: "1 + 1" }, ""), [], "well-formed python_repl args must be accepted");
+	assert.ok(validateJsonSchemaValue(replTool.parameters, {}, "").length > 0, "missing code must be rejected");
 
 	const agent = { session: { id: "s", header: { cwd: "C:/work/p" }, deriveMessages: () => [] } };
 	const args = {

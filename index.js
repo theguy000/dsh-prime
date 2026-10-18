@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 
 export const name = "prime-memory";
 /* cordis Inject.resolve has no required/optional concept: an OBJECT inject is a
@@ -27,6 +28,7 @@ export const name = "prime-memory";
 export const inject = ["commands", "webServer"];
 
 export const MAX_ENTRIES = 200;
+export const MAX_SNAPSHOTS = 25;
 export const SECTION_ORDER = 9500;
 export const SECTION_NAME = "prime:continual-harness";
 /* The section is never empty: an empty harness is exactly when the capture
@@ -47,6 +49,7 @@ const HARNESS_INSTRUCTION = [
    * session split one sentence across both layers — and the choice belongs to the
    * operator anyway, who can see which memory they are looking at. */
   "You do not choose where a fact is stored; the operator does, and the line below says which layer is currently selected. You always READ both layers. You only WRITE to the selected one.",
+  "For stateful RLM exploration, context-as-a-variable (`ctx`, `messages`, `store`), or programmatic Python subagent and harness orchestration (`rlm.spawn`, `rlm.list_subagents`, `rlm.send_message`, `agent_message.send`, `rlm.harness`, `tools.*`), call `python_repl`.",
 ].join(" ");
 const TOP_K = 12;
 const CHAR_BUDGET = 4000;
@@ -59,6 +62,7 @@ const COOLDOWN_MS = 20 * 60 * 1000;
  * session whose cwd is this directory — the same footing the term has in the
  * rest of the harness. */
 export const SCOPES = ["session", "workspace"];
+export const KINDS = ["memory", "prompt", "skill", "subagent"];
 /* The middle scope's on-disk key still says `project-`. Renaming it would orphan
  * every existing `project-<sha1(cwd)>.json` file instead of reading it, which is
  * a worse trade than a filename that lags its label. */
@@ -67,6 +71,7 @@ const LEGACY_SCOPE_PREFIX = "project-";
  * only the operator can run a command, so the prompt and the tool must agree
  * on one name. Declared here because this module owns the shared surface. */
 export const TOOL_NAME = "harness_refine";
+export const REPL_TOOL_NAME = "python_repl";
 /* The preset this plugin's agent-facing half is mounted in. The auto-refine hook
  * must name it: the root plane sees every session in the process, so without
  * this the hook would inject a refinement turn into `standard`, `ptc`, and every
@@ -109,6 +114,9 @@ function scopeKey(scope, agent) {
 function scopeFile(scope, agent) {
   return path.join(rootDir(), scopeKey(scope, agent) + ".json");
 }
+function replStoreFile(agent) {
+  return path.join(rootDir(), "repl-" + scopeKey("session", agent) + ".json");
+}
 function configFile() {
   return path.join(rootDir(), "config.json");
 }
@@ -125,7 +133,7 @@ function readJson(file, fallback) {
 }
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = file + "." + process.pid + ".tmp";
+  const tmp = file + "." + process.pid + "." + crypto.randomUUID().slice(0, 8) + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2), "utf8");
   fs.renameSync(tmp, file);
 }
@@ -144,15 +152,42 @@ export function saveConfig(patch) {
   writeJson(configFile(), next);
   return next;
 }
-export function load(scope, agent) {
-  const doc = readJson(scopeFile(normalizeScope(scope, "session"), agent), { entries: [] });
-  const entries = Array.isArray(doc.entries) ? doc.entries.filter((e) => e && typeof e.text === "string") : [];
-  return entries;
-}
-export function save(scope, agent, entries) {
+const cloneEntries = (arr) => (Array.isArray(arr) ? arr : []).map((e) => Object.assign({}, e));
+function readScopeDoc(scope, agent) {
   const resolved = normalizeScope(scope, "session");
-  writeJson(scopeFile(resolved, agent), { version: 2, scope: resolved, entries });
+  const doc = readJson(scopeFile(resolved, agent), { entries: [], snapshots: [] });
+  const entries = Array.isArray(doc.entries) ? doc.entries.filter((e) => e && typeof e.text === "string") : [];
+  const snapshots = Array.isArray(doc.snapshots) ? doc.snapshots.filter((s) => s && typeof s.id === "string" && Array.isArray(s.before)) : [];
+  return { resolved, entries, snapshots };
 }
+export function load(scope, agent) { return readScopeDoc(scope, agent).entries; }
+export function loadSnapshots(scope, agent) { return readScopeDoc(scope, agent).snapshots; }
+export function save(scope, agent, entries, snapshotMeta) {
+  const { resolved, snapshots } = readScopeDoc(scope, agent);
+  const next = snapshots.slice();
+  if (snapshotMeta && Array.isArray(snapshotMeta.before)) {
+    const id = snapshotMeta.id || crypto.randomUUID();
+    next.push({
+      id, ref: String(id).slice(0, REF_LENGTH), createdAt: snapshotMeta.createdAt || Date.now(),
+      reason: String(snapshotMeta.reason || "update"), beforeCount: snapshotMeta.before.length,
+      afterCount: Array.isArray(entries) ? entries.length : 0,
+      diff: snapshotMeta.diff || computeDiffCounts(snapshotMeta.before, entries),
+      before: cloneEntries(snapshotMeta.before), after: cloneEntries(entries),
+    });
+    while (next.length > MAX_SNAPSHOTS) next.shift();
+  }
+  const cwdMeta = resolved === "workspace" ? sessionCwd(agent) : undefined;
+  writeJson(scopeFile(resolved, agent), {
+    version: 3,
+    scope: resolved,
+    ...(cwdMeta ? { cwd: cwdMeta } : {}),
+    entries,
+    snapshots: next,
+  });
+  if (skillsInvalidator) { try { skillsInvalidator(); } catch {} }
+}
+let skillsInvalidator = null;
+export function registerSkillsInvalidator(fn) { skillsInvalidator = typeof fn === "function" ? fn : null; }
 
 /* ---------- which session is the operator in? ---------- */
 
@@ -223,6 +258,10 @@ export function resolveActiveSession(ctx) {
 export function normalizeScope(scope, fallback) {
   const named = SCOPE_ALIASES[String(scope || "").toLowerCase()];
   return SCOPES.includes(named) ? named : fallback;
+}
+export function normalizeKind(kind, fallback = "memory") {
+  const k = String(kind || "").trim().toLowerCase();
+  return KINDS.includes(k) ? k : fallback;
 }
 
 /* ---------- ranking (prime harness_digest.rs parity) ---------- */
@@ -315,10 +354,10 @@ function queryTerms(agent, extra) {
 export function rank(entries, agent, extra) {
   const q = queryTerms(agent, extra);
   if (q.length === 0) {
-    return entries.slice().sort((a, b) => b.createdAt - a.createdAt);
+    return entries.slice().sort((a, b) => (Number(!!b.pinned) - Number(!!a.pinned)) || (b.createdAt - a.createdAt));
   }
   const scored = entries.map((e) => {
-    const hay = String(e.text).toLowerCase();
+    const hay = (String(e.name || "") + " " + String(e.text || "")).toLowerCase();
     let score = 0;
     for (const { term, weight } of q) if (hay.includes(term)) score += weight;
     if (e.pinned) score += 100;
@@ -361,6 +400,11 @@ const SCOPE_OUTCOME = {
   workspace: "this workspace — every chat in this folder sees it",
 };
 
+function formatEntryTag(e) {
+  const kind = e && e.kind && e.kind !== "memory" ? e.kind : "";
+  const n = e && e.name ? String(e.name).trim() : "";
+  return !kind && !n ? "" : "[" + (kind && n ? kind + ":" + n : kind || n) + "] ";
+}
 export function render(entries, agent, extra) {
   const cfg = loadConfig();
   const target = "New entries are saved to the " + cfg.defaultScope + " layer (" +
@@ -378,7 +422,7 @@ export function render(entries, agent, extra) {
      * same pass that notices it. Without it the model can only append a
      * correction beside the mistake — which is how contradictions accumulate. */
     const ref = entryRef(e);
-    const line = "- " + (ref ? ref + " " : "") + (date ? "[" + date + "] " : "") + e.text;
+    const line = "- " + (ref ? ref + " " : "") + (date ? "[" + date + "] " : "") + formatEntryTag(e) + e.text;
     if (used + line.length > CHAR_BUDGET) break;
     used += line.length;
     lines.push(line);
@@ -392,23 +436,36 @@ export function render(entries, agent, extra) {
 
 /* ---------- writes ---------- */
 
-export function upsert(scope, agent, text, origin, evidence) {
+function computeDiffCounts(before, after) {
+  const bMap = new Map((before || []).map((e) => [e.id, e]));
+  const aMap = new Map((after || []).map((e) => [e.id, e]));
+  let added = 0, updated = 0, deleted = 0;
+  for (const [id, entry] of aMap) {
+    const p = bMap.get(id);
+    if (!p) added++;
+    else if (p.text !== entry.text || p.kind !== entry.kind || p.name !== entry.name || !!p.pinned !== !!entry.pinned) updated++;
+  }
+  for (const id of bMap.keys()) if (!aMap.has(id)) deleted++;
+  return { added, updated, deleted };
+}
+export function upsert(scope, agent, text, origin, evidence, opts) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return { ok: false, error: "empty refinement" };
   const entries = load(scope, agent);
+  const before = cloneEntries(entries);
   if (entries.some((e) => e.text === trimmed)) return { ok: false, error: "already recorded" };
   if (entries.length >= MAX_ENTRIES) return { ok: false, error: "harness full (" + MAX_ENTRIES + "); run /refine --clear" };
   const now = Date.now();
-  entries.push({
-    id: crypto.randomUUID(),
-    text: trimmed,
-    createdAt: now,
-    updatedAt: now,
-    origin: origin || "command",
-    ...(evidence ? { evidence: String(evidence).trim() } : {}),
-  });
-  save(scope, agent, entries);
-  return { ok: true, count: entries.length, scope };
+  const kind = normalizeKind(opts && opts.kind, "memory");
+  const entryName = opts && typeof opts.name === "string" && opts.name.trim() ? opts.name.trim() : undefined;
+  const created = {
+    id: crypto.randomUUID(), text: trimmed, createdAt: now, updatedAt: now, origin: origin || "command",
+    ...(kind !== "memory" ? { kind } : {}), ...(entryName ? { name: entryName } : {}),
+    ...(opts && opts.pinned ? { pinned: true } : {}), ...(evidence ? { evidence: String(evidence).trim() } : {}),
+  };
+  entries.push(created);
+  save(scope, agent, entries, (opts && opts.skipSnapshot) ? undefined : { reason: (origin || "command") + ":add", before, diff: { added: 1, updated: 0, deleted: 0 } });
+  return { ok: true, count: entries.length, scope: normalizeScope(scope, "session"), ref: entryRef(created), entry: created };
 }
 
 /* The handle a reader uses to name one entry. Eight characters of a UUID are
@@ -504,22 +561,44 @@ export function findEntry(entries, ref) {
  * @param evidence - what prompted the correction.
  * @returns `{ ok, error? }`.
  */
-export function updateEntry(scope, agent, ref, text, evidence) {
+export function updateEntry(scope, agent, ref, text, evidence, opts) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return { ok: false, error: "empty replacement text" };
   const located = locateEntry(agent, scope, ref);
   if (!located.ok) return located;
   const entries = load(located.scope, agent);
+  const before = cloneEntries(entries);
   const found = findEntry(entries, ref);
   if (!found.ok) return found;
-  if (entries.some((e) => e !== found.entry && e.text === trimmed)) {
-    return { ok: false, error: "another entry already says that" };
-  }
+  if (entries.some((e) => e !== found.entry && e.text === trimmed)) return { ok: false, error: "another entry already says that" };
   found.entry.text = trimmed;
   found.entry.updatedAt = Date.now();
   if (evidence) found.entry.evidence = String(evidence).trim();
-  save(located.scope, agent, entries);
-  return { ok: true, count: entries.length, scope: located.scope, ref: entryRef(found.entry) };
+  if (opts && opts.kind !== undefined) {
+    const k = normalizeKind(opts.kind, "memory");
+    if (k === "memory") delete found.entry.kind; else found.entry.kind = k;
+  }
+  if (opts && opts.name !== undefined) {
+    const n = String(opts.name || "").trim();
+    if (n) found.entry.name = n; else delete found.entry.name;
+  }
+  if (opts && typeof opts.pinned === "boolean") {
+    if (opts.pinned) found.entry.pinned = true; else delete found.entry.pinned;
+  }
+  save(located.scope, agent, entries, (opts && opts.skipSnapshot) ? undefined : { reason: "update:" + entryRef(found.entry), before, diff: { added: 0, updated: 1, deleted: 0 } });
+  return { ok: true, count: entries.length, scope: located.scope, ref: entryRef(found.entry), entry: found.entry };
+}
+export function pinEntry(scope, agent, ref, pinned = true, opts) {
+  const located = locateEntry(agent, scope, ref);
+  if (!located.ok) return located;
+  const entries = load(located.scope, agent);
+  const before = cloneEntries(entries);
+  const found = findEntry(entries, ref);
+  if (!found.ok) return found;
+  if (pinned) found.entry.pinned = true; else delete found.entry.pinned;
+  found.entry.updatedAt = Date.now();
+  save(located.scope, agent, entries, (opts && opts.skipSnapshot) ? undefined : { reason: (pinned ? "pin:" : "unpin:") + entryRef(found.entry), before, diff: { added: 0, updated: 1, deleted: 0 } });
+  return { ok: true, count: entries.length, scope: located.scope, ref: entryRef(found.entry), pinned: !!found.entry.pinned, entry: found.entry };
 }
 
 /**
@@ -529,15 +608,65 @@ export function updateEntry(scope, agent, ref, text, evidence) {
  * @param ref - the entry handle.
  * @returns `{ ok, error? }`.
  */
-export function removeEntry(scope, agent, ref) {
+export function removeEntry(scope, agent, ref, opts) {
   const located = locateEntry(agent, scope, ref);
   if (!located.ok) return located;
   const entries = load(located.scope, agent);
+  const before = cloneEntries(entries);
   const found = findEntry(entries, ref);
   if (!found.ok) return found;
   const kept = entries.filter((e) => e !== found.entry);
-  save(located.scope, agent, kept);
+  save(located.scope, agent, kept, (opts && opts.skipSnapshot) ? undefined : { reason: "delete:" + entryRef(found.entry), before, diff: { added: 0, updated: 0, deleted: 1 } });
   return { ok: true, count: kept.length, scope: located.scope, ref: entryRef(found.entry) };
+}
+export function recordPassSnapshot(scope, agent, beforeEntries, reason) {
+  const current = load(scope, agent);
+  const diff = computeDiffCounts(beforeEntries, current);
+  if (!diff.added && !diff.updated && !diff.deleted) return null;
+  save(scope, agent, current, { reason: reason || ("pass (+" + diff.added + " ~" + diff.updated + " -" + diff.deleted + ")"), before: beforeEntries, diff });
+  return loadSnapshots(scope, agent).at(-1) || null;
+}
+export function findSnapshot(snapshots, ref) {
+  if (!Array.isArray(snapshots) || !snapshots.length) return { ok: false, error: "no snapshots recorded yet" };
+  const w = String(ref || "").trim().toLowerCase();
+  if (!w) return { ok: true, snapshot: snapshots[snapshots.length - 1] };
+  const exact = snapshots.filter((s) => String(s.id).toLowerCase() === w || String(s.ref || "").toLowerCase() === w);
+  if (exact.length === 1) return { ok: true, snapshot: exact[0] };
+  const pref = snapshots.filter((s) => String(s.id).toLowerCase().startsWith(w));
+  if (pref.length === 1) return { ok: true, snapshot: pref[0] };
+  return { ok: false, error: pref.length > 1 ? "snapshot ref " + w + " matches " + pref.length + " snapshots" : "no snapshot with ref " + w };
+}
+export function rollbackSnapshot(scope, agent, snapshotRef) {
+  const resolved = normalizeScope(scope, "session");
+  const { entries, snapshots } = readScopeDoc(resolved, agent);
+  const found = findSnapshot(snapshots, snapshotRef);
+  if (!found.ok) return found;
+  const restored = cloneEntries(found.snapshot.before);
+  const ref = entryRef(found.snapshot);
+  save(resolved, agent, restored, { reason: "rollback:" + ref, before: entries, diff: computeDiffCounts(entries, restored) });
+  return { ok: true, scope: resolved, ref, restoredCount: restored.length, previousCount: entries.length, entries: restored };
+}
+export function diffSnapshot(scope, agent, snapshotRef) {
+  const resolved = normalizeScope(scope, "session");
+  const found = findSnapshot(readScopeDoc(resolved, agent).snapshots, snapshotRef);
+  if (!found.ok) return found;
+  const snap = found.snapshot;
+  const before = snap.before || [], after = snap.after || load(resolved, agent);
+  const bMap = new Map(before.map((e) => [e.id, e])), aMap = new Map(after.map((e) => [e.id, e]));
+  const lines = [];
+  for (const [id, e] of aMap) {
+    const p = bMap.get(id);
+    if (!p) lines.push("+ " + entryRef(e) + " " + formatEntryTag(e) + e.text);
+    else if (p.text !== e.text || p.kind !== e.kind || p.name !== e.name || !!p.pinned !== !!e.pinned) {
+      lines.push("~ " + entryRef(e) + " before: " + p.text, "  " + entryRef(e) + " after:  " + formatEntryTag(e) + e.text);
+    }
+  }
+  for (const [id, p] of bMap) if (!aMap.has(id)) lines.push("- " + entryRef(p) + " " + formatEntryTag(p) + p.text);
+  return {
+    ok: true, scope: resolved, ref: entryRef(snap), reason: snap.reason || "update",
+    createdAt: snap.createdAt, beforeCount: before.length, afterCount: after.length, lines,
+    text: "snapshot " + entryRef(snap) + " (" + (snap.reason || "update") + ", " + before.length + " -> " + after.length + " entries):\n" + (lines.length ? lines.join("\n") : "(no entry changes)"),
+  };
 }
 
 const USAGE = "usage: /refine [session|workspace] [<note>] — no note runs a refinement pass; /refine --list; /refine --clear";
@@ -650,11 +779,51 @@ export function refine(rawInput, agent) {
   if (body === "--list") {
     const entries = load(scope, agent);
     if (!entries.length) return ok("harness (" + scope + ") is empty");
-    return ok("harness (" + scope + "):\n" + rank(entries, agent).map((e) => "- " + e.text).join("\n"));
+    return ok("harness (" + scope + "):\n" + rank(entries, agent).map((e) => "- " + formatEntryTag(e) + e.text).join("\n"));
   }
   if (body === "--clear") {
-    save(scope, agent, []);
+    const prev = load(scope, agent);
+    save(scope, agent, [], prev.length ? { reason: "command:clear", before: prev, diff: { added: 0, updated: 0, deleted: prev.length } } : undefined);
     return ok("cleared harness (" + scope + ")");
+  }
+  if (body === "--snapshots" || body === "--history") {
+    const snaps = loadSnapshots(scope, agent);
+    if (!snaps.length) return ok("no snapshots recorded for " + scope + " harness");
+    return ok("snapshots (" + scope + "):\n" + snaps.slice().reverse().map((s) => {
+      const d = entryDate(s.createdAt), df = s.diff || { added: 0, updated: 0, deleted: 0 };
+      return "- " + entryRef(s) + (d ? " [" + d + "]" : "") + " " + (s.reason || "update") + " (" + s.beforeCount + " -> " + s.afterCount + "; +" + df.added + " ~" + df.updated + " -" + df.deleted + ")";
+    }).join("\n"));
+  }
+  if (body === "--rollback" || body.startsWith("--rollback ") || body === "--undo" || body.startsWith("--undo ")) {
+    const res = rollbackSnapshot(scope, agent, body.replace(/^--(rollback|undo)\b/, "").trim());
+    return res.ok ? ok("rolled back " + res.scope + " harness to snapshot " + res.ref + " (" + res.previousCount + " -> " + res.restoredCount + " entries)") : err("refine: " + res.error);
+  }
+  if (body === "--diff" || body.startsWith("--diff ")) {
+    const res = diffSnapshot(scope, agent, body.replace(/^--diff\b/, "").trim());
+    return res.ok ? ok(res.text) : err("refine: " + res.error);
+  }
+  if (body.startsWith("--pin ") || body.startsWith("--unpin ")) {
+    const isPin = body.startsWith("--pin ");
+    const targetRef = body.replace(/^--(un)?pin\b/, "").trim();
+    if (!targetRef) return err("refine: no ref given\n" + USAGE);
+    const res = pinEntry(scope, agent, targetRef, isPin);
+    return res.ok ? ok((isPin ? "pinned " : "unpinned ") + res.ref + " in " + res.scope + " harness") : err("refine: " + res.error);
+  }
+  if (body.startsWith("--delete ") || body.startsWith("--rm ")) {
+    const targetRef = body.replace(/^--(delete|rm)\b/, "").trim();
+    if (!targetRef) return err("refine: no ref given\n" + USAGE);
+    const res = removeEntry(scope, agent, targetRef);
+    return res.ok ? ok("deleted " + res.ref + " from " + res.scope + " harness (" + res.count + "/" + MAX_ENTRIES + ")") : err("refine: " + res.error);
+  }
+  if (body.startsWith("--edit ")) {
+    const m = /^(\S+)\s+([\s\S]+)$/.exec(body.replace(/^--edit\b/, "").trim());
+    if (!m) return err("refine: usage: /refine [scope] --edit <ref> <new text>");
+    const res = updateEntry(scope, agent, m[1], m[2], "edited via /refine --edit");
+    return res.ok ? ok("updated " + res.ref + " in " + res.scope + " harness") : err("refine: " + res.error);
+  }
+  if (body === "--reset-repl") {
+    resetPythonRepl(agent);
+    return ok("reset persistent RLM Python REPL for this session");
   }
   /* A bare `/refine` is the refinement pass itself, not a usage error. */
   if (!body) {
@@ -774,14 +943,531 @@ function readBody(req) {
     req.on("error", reject);
   });
 }
+export function extractSessionContext(agent) {
+  const messages = [];
+  try {
+    const session = agent && agent.session;
+    const surfaceNodes = session && session.surface && Array.isArray(session.surface.nodes) ? new Set(session.surface.nodes) : null;
+    if (session && typeof session.snapshotEvents === "function") {
+      for (const ev of session.snapshotEvents() || []) {
+        if (!ev) continue;
+        if (ev.type === "user/message" && ev.data && isSpeaker(ev.data)) {
+          const text = messageText(ev.data);
+          if (text) messages.push({ seq: ev.seq ?? messages.length, role: "user", text, compacted: surfaceNodes ? !surfaceNodes.has(ev.seq) : false });
+        } else if (ev.type === "assistant/message" && ev.data && ev.data.message) {
+          const text = messageText(ev.data.message);
+          if (text) messages.push({ seq: ev.seq ?? messages.length, role: "assistant", text, compacted: surfaceNodes ? !surfaceNodes.has(ev.seq) : false });
+        }
+      }
+    }
+    if (messages.length === 0) {
+      liveMessages(agent).forEach((m, idx) => {
+        if (!m || (m.role !== "user" && m.role !== "assistant") || !isSpeaker(m)) return;
+        const text = messageText(m);
+        if (text) messages.push({ seq: idx, role: m.role, text, compacted: false });
+      });
+    }
+  } catch {}
+  const ctxText = messages.map((m) => "[" + m.role + (m.compacted ? ":compacted" : "") + "]\n" + m.text).join("\n\n");
+  let goal = null;
+  try {
+    const obj = goalsApi && agent ? goalsApi.get(agent)?.objective : null;
+    if (typeof obj === "string" && obj.trim()) goal = obj.trim();
+  } catch { goal = null; }
+  return { ctx: ctxText, messages, goal, workspace: sessionCwd(agent) };
+}
+
+export function loadReplStore(agent) {
+  const doc = readJson(replStoreFile(agent), { store: {} });
+  return doc && doc.store && typeof doc.store === "object" && !Array.isArray(doc.store) ? doc.store : {};
+}
+export function saveReplStore(agent, store) {
+  if (!store || typeof store !== "object" || Array.isArray(store)) return {};
+  writeJson(replStoreFile(agent), { version: 1, updatedAt: Date.now(), store });
+  return store;
+}
+
+let cachedPythonExe = undefined;
+export function findPythonExecutable() {
+  if (cachedPythonExe !== undefined) return cachedPythonExe;
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const relPy = path.join("Programs", "DeepSeek Harness", "resources", "runtime", "primary-runtime", "dependencies", "python", process.platform === "win32" ? "python.exe" : "bin/python3");
+  const candidates = [
+    process.env.DSH_PYTHON,
+    path.join(localAppData, relPy),
+    ...(process.platform === "win32" ? ["python", "python3"] : ["python3", "python"]),
+  ].filter(Boolean);
+  for (const cmd of candidates) {
+    try {
+      if (path.isAbsolute(cmd) && !fs.existsSync(cmd)) continue;
+      const probe = spawnSync(cmd, ["-c", "import sys; print(sys.version_info[0])"], { encoding: "utf8", timeout: 4000, windowsHide: true });
+      if (probe.status === 0 && String(probe.stdout || "").trim() === "3") return (cachedPythonExe = cmd);
+    } catch {}
+  }
+  return (cachedPythonExe = null);
+}
+
+const CMD_PREFIX = "\x00DSH_CMD:";
+const RPC_PREFIX = "\x00DSH_RPC:";
+const REPLY_PREFIX = "\x00DSH_REPLY:";
+const DONE_PREFIX = "\x00DSH_DONE:";
+const READY_LINE = "\x00DSH_READY";
+
+const PYTHON_WORKER_SCRIPT = [
+  "import ast, asyncio, io, json, os, sys, traceback",
+  "_in, _out = sys.__stdin__, sys.__stdout__",
+  "_CMD, _RPC, _REPLY, _DONE, _READY = '\\x00DSH_CMD:', '\\x00DSH_RPC:', '\\x00DSH_REPLY:', '\\x00DSH_DONE:', '\\x00DSH_READY'",
+  "class AwaitableDict(dict):",
+  "    def __getattr__(self, k):",
+  "        try: return self[k]",
+  "        except KeyError: raise AttributeError(k)",
+  "    def __await__(self):",
+  "        async def _c(): return self",
+  "        return _c().__await__()",
+  "class AwaitableList(list):",
+  "    def __await__(self):",
+  "        async def _c(): return self",
+  "        return _c().__await__()",
+  "class AwaitableStr(str):",
+  "    def __await__(self):",
+  "        async def _c(): return str(self)",
+  "        return _c().__await__()",
+  "class AwaitableInt(int):",
+  "    def __await__(self):",
+  "        async def _c(): return int(self)",
+  "        return _c().__await__()",
+  "class AwaitableFloat(float):",
+  "    def __await__(self):",
+  "        async def _c(): return float(self)",
+  "        return _c().__await__()",
+  "def _wrap(v):",
+  "    if isinstance(v, dict): return AwaitableDict({k: _wrap(x) for k, x in v.items()})",
+  "    if isinstance(v, list): return AwaitableList([_wrap(x) for x in v])",
+  "    if isinstance(v, str): return AwaitableStr(v)",
+  "    if isinstance(v, bool): return v",
+  "    if isinstance(v, int): return AwaitableInt(v)",
+  "    if isinstance(v, float): return AwaitableFloat(v)",
+  "    return v",
+  "_seq = 0",
+  "def _rpc(method, params):",
+  "    global _seq; _seq += 1",
+  "    _out.write(_RPC + json.dumps({'id': _seq, 'method': method, 'params': params}) + '\\n'); _out.flush()",
+  "    while True:",
+  "        l = _in.readline()",
+  "        if not l: raise RuntimeError('RLM host channel closed')",
+  "        if l.startswith(_REPLY):",
+  "            r = json.loads(l[len(_REPLY):])",
+  "            if not r.get('ok'): raise RuntimeError(r.get('error') or 'RLM RPC failed')",
+  "            return _wrap(r.get('value'))",
+  "class _Harness:",
+  "    def list(self, scope=None, kind=None): return _rpc('harness.list', {'scope': scope, 'kind': kind})",
+  "    def add(self, text, evidence='recorded from python_repl', kind='memory', name=None, pinned=False):",
+  "        return _rpc('harness.add', {'text': text, 'evidence': evidence, 'kind': kind, 'name': name, 'pinned': bool(pinned)})",
+  "    def update(self, ref, text, evidence='updated from python_repl', kind=None, name=None, pinned=None):",
+  "        return _rpc('harness.update', {'ref': ref, 'text': text, 'evidence': evidence, 'kind': kind, 'name': name, 'pinned': pinned})",
+  "    def delete(self, ref): return _rpc('harness.delete', {'ref': ref})",
+  "    def snapshots(self, scope=None): return _rpc('harness.snapshots', {'scope': scope})",
+  "    def rollback(self, ref=None, scope=None): return _rpc('harness.rollback', {'ref': ref, 'scope': scope})",
+  "    def diff(self, ref=None, scope=None): return _rpc('harness.diff', {'ref': ref, 'scope': scope})",
+  "class _Rlm:",
+  "    def __init__(self): self.harness = _Harness()",
+  "    def __call__(self, prompt, name=None, model=None, provider=None, fork=False, cwd=None, role=None):",
+  "        return self.spawn(prompt, name=name, model=model, provider=provider, fork=fork, cwd=cwd, role=role)",
+  "    def spawn(self, prompt, name=None, model=None, provider=None, fork=False, cwd=None, role=None):",
+  "        return _rpc('rlm.spawn', {'prompt': prompt, 'name': name, 'model': model, 'provider': provider, 'fork': bool(fork), 'cwd': cwd, 'role': role})",
+  "    def list_subagents(self): return _rpc('rlm.list_subagents', {})",
+  "    def send_message(self, agent_id, message): return _rpc('rlm.send_message', {'agent_id': agent_id, 'message': message})",
+  "    def interrupt(self, agent_id): return _rpc('rlm.interrupt', {'agent_id': agent_id})",
+  "    def tool(self, name, *a, **kw): return _rpc('tool', {'name': name, 'args': a[0] if (a and isinstance(a[0], dict) and not kw) else dict(kw)})",
+  "class _AgentMsg:",
+  "    def send(self, message, receiver_name='main'): return _rpc('rlm.send_message', {'agent_id': receiver_name, 'message': message})",
+  "class _Tools:",
+  "    def __getattr__(self, n): return lambda *a, **kw: _rpc('tool', {'name': n, 'args': a[0] if (a and isinstance(a[0], dict) and not kw) else dict(kw)})",
+  "    def __getitem__(self, n): return getattr(self, n)",
+  "def _jsonable(v):",
+  "    if v is None or isinstance(v, (bool, int, float, str)): return v",
+  "    if isinstance(v, (list, tuple)): return [_jsonable(x) for x in v[:200]]",
+  "    if isinstance(v, dict): return {str(k): _jsonable(val) for k, val in list(v.items())[:200]}",
+  "    return repr(v)",
+  "_RES = {'__builtins__','__name__','__doc__','__package__','__loader__','__spec__','ctx','messages','goal','workspace','store','rlm','agent_message','tools','_'}",
+  "def _mk(): return {'__name__':'__main__','ctx':'','messages':[],'goal':None,'workspace':os.getcwd(),'store':{},'rlm':_Rlm(),'agent_message':_AgentMsg(),'tools':_Tools(),'_':None}",
+  "_ns, _loop, _cwd_init = _mk(), asyncio.new_event_loop(), False",
+  "asyncio.set_event_loop(_loop)",
+  "async def _eval(code, ns):",
+  "    mod = ast.parse(code, filename='<python_repl>', mode='exec')",
+  "    last = ast.Expression(mod.body.pop().value) if (mod.body and isinstance(mod.body[-1], ast.Expr)) else None",
+  "    ast.fix_missing_locations(mod)",
+  "    c = eval(compile(mod, '<python_repl>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT), ns, ns)",
+  "    if asyncio.iscoroutine(c): await c",
+  "    if last is None: return None",
+  "    ast.fix_missing_locations(last)",
+  "    v = eval(compile(last, '<python_repl>', 'eval', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT), ns, ns)",
+  "    if asyncio.iscoroutine(v): v = await v",
+  "    ns['_'] = v; return v",
+  "_out.write(_READY + '\\n'); _out.flush()",
+  "while True:",
+  "    line = _in.readline()",
+  "    if not line: break",
+  "    if not line.startswith(_CMD): continue",
+  "    cmd = json.loads(line[len(_CMD):])",
+  "    if cmd.get('reset'): _ns, _cwd_init = _mk(), False",
+  "    if cmd.get('cwd') and not _cwd_init:",
+  "        try: os.chdir(cmd['cwd']); _cwd_init = True",
+  "        except Exception: pass",
+  "    cx = cmd.get('context') or {}",
+  "    _ns['ctx'], _ns['messages'], _ns['goal'], _ns['workspace'] = cx.get('ctx',''), cx.get('messages',[]), cx.get('goal'), cx.get('workspace') or os.getcwd()",
+  "    if isinstance(cx.get('store'), dict):",
+  "        if not isinstance(_ns.get('store'), dict): _ns['store'] = {}",
+  "        for k, v in cx['store'].items(): _ns['store'].setdefault(k, v)",
+  "    if isinstance(cmd.get('set_vars'), dict):",
+  "        for k, v in cmd['set_vars'].items():",
+  "            _ns[k] = v",
+  "            if isinstance(_ns.get('store'), dict): _ns['store'][k] = v",
+  "    ob, eb, ok_f, err_t, res_v = io.StringIO(), io.StringIO(), True, None, None",
+  "    sys.stdout, sys.stderr = ob, eb",
+  "    try: res_v = _jsonable(_loop.run_until_complete(_eval(cmd.get('code') or '', _ns)))",
+  "    except BaseException as ex: ok_f = False; err_t = f'{type(ex).__name__}: {ex}'; eb.write(traceback.format_exc())",
+  "    finally: sys.stdout, sys.stderr = _out, sys.__stderr__",
+  "    uv = sorted([k for k, v in _ns.items() if k not in _RES and not k.startswith('_') and not hasattr(v, '__spec__')])",
+  "    st = {}",
+  "    if isinstance(_ns.get('store'), dict):",
+  "        for k, v in _ns['store'].items():",
+  "            try: json.dumps(v); st[str(k)] = v",
+  "            except Exception: st[str(k)] = repr(v)",
+  "    _out.write(_DONE + json.dumps({'id':cmd.get('id'),'ok':ok_f,'stdout':ob.getvalue(),'stderr':eb.getvalue(),'result':res_v,'variables':uv,'store':st,**({'error':err_t} if err_t else {})}) + '\\n'); _out.flush()",
+].join("\n");
+
+const replKernels = new Map();
+class ReplKernel {
+  constructor(sessionKey, pythonExe) {
+    this.sessionKey = sessionKey; this.pythonExe = pythonExe;
+    this.proc = null; this.active = null; this.buffer = ""; this.evalCount = 0; this.variables = [];
+  }
+  ensureStarted(cwd) {
+    if (this.proc && !this.proc.killed && this.proc.exitCode === null) return this.readyPromise;
+    this.buffer = "";
+    this.readyPromise = new Promise((resolve, reject) => {
+      const proc = spawn(this.pythonExe, ["-u", "-c", PYTHON_WORKER_SCRIPT], {
+        cwd: cwd && fs.existsSync(cwd) ? cwd : process.cwd(),
+        env: Object.assign({}, process.env, { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1", PYTHONUNBUFFERED: "1" }),
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      this.proc = proc;
+      let settledReady = false;
+      proc.stdout.setEncoding("utf8");
+      proc.stderr.setEncoding("utf8");
+      proc.stdout.on("data", (chunk) => {
+        this.buffer += chunk;
+        let idx;
+        while ((idx = this.buffer.indexOf("\n")) !== -1) {
+          const line = this.buffer.slice(0, idx).replace(/\r$/, "");
+          this.buffer = this.buffer.slice(idx + 1);
+          if (!settledReady && line === READY_LINE) { settledReady = true; resolve(); continue; }
+          this.onLine(line);
+        }
+      });
+      proc.on("error", (err) => {
+        if (!settledReady) { settledReady = true; reject(err); }
+        if (this.active) { const cur = this.active; this.active = null; cur.reject(err); }
+      });
+      proc.on("close", (code) => {
+        this.proc = null;
+        if (!settledReady) { settledReady = true; reject(new Error("Python REPL exited (" + code + ")")); }
+        if (this.active) { const cur = this.active; this.active = null; cur.reject(new Error("Python REPL exited (" + code + ")")); }
+      });
+    });
+    return this.readyPromise;
+  }
+  onLine(line) {
+    if (!this.active) return;
+    if (line.startsWith(RPC_PREFIX)) {
+      let req;
+      try { req = JSON.parse(line.slice(RPC_PREFIX.length)); } catch (e) { return this.sendReply({ id: 0, ok: false, error: e.message }); }
+      Promise.resolve().then(() => this.active.onRpc(req.method, req.params || {})).then(
+        (value) => this.sendReply({ id: req.id, ok: true, value: value === undefined ? null : value }),
+        (error) => this.sendReply({ id: req.id, ok: false, error: (error && error.message) || String(error) }),
+      );
+      return;
+    }
+    if (line.startsWith(DONE_PREFIX)) {
+      const cur = this.active; this.active = null;
+      try {
+        const data = JSON.parse(line.slice(DONE_PREFIX.length));
+        this.variables = Array.isArray(data.variables) ? data.variables : [];
+        cur.resolve(data);
+      } catch (e) { cur.reject(e); }
+    }
+  }
+  sendReply(payload) {
+    if (this.proc && this.proc.stdin && !this.proc.killed) {
+      try { this.proc.stdin.write(REPLY_PREFIX + JSON.stringify(payload) + "\n"); } catch {}
+    }
+  }
+  async evaluate(cmdPayload, onRpc, timeoutMs = 120000) {
+    if (this.active) throw new Error("persistent Python REPL is busy");
+    await this.ensureStarted(cmdPayload.cwd);
+    const id = ++this.evalCount;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.active && this.active.id === id) {
+          this.active = null; this.dispose();
+          resolve({ id, ok: false, stdout: "", stderr: "Timed out after " + timeoutMs + "ms", result: null, variables: [], store: cmdPayload.context?.store || {}, error: "TimeoutError" });
+        }
+      }, timeoutMs);
+      this.active = {
+        id, onRpc,
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      };
+      try { this.proc.stdin.write(CMD_PREFIX + JSON.stringify(Object.assign({}, cmdPayload, { id })) + "\n"); }
+      catch (e) { clearTimeout(timer); this.active = null; reject(e); }
+    });
+  }
+  dispose() {
+    if (this.proc) { try { this.proc.kill(); } catch {} this.proc = null; }
+    this.active = null; this.variables = [];
+  }
+}
+
+export function resetPythonRepl(agent) {
+  const key = scopeKey("session", agent);
+  const kernel = replKernels.get(key);
+  if (kernel) { kernel.dispose(); replKernels.delete(key); }
+  return { ok: true, sessionKey: key };
+}
+export function getReplStatus(agent) {
+  const key = scopeKey("session", agent);
+  const kernel = replKernels.get(key);
+  const store = loadReplStore(agent);
+  return {
+    active: Boolean(kernel && kernel.proc && !kernel.proc.killed),
+    evalCount: kernel ? kernel.evalCount : 0,
+    variables: kernel ? kernel.variables : [],
+    storeKeys: Object.keys(store),
+    pythonExecutable: findPythonExecutable(),
+  };
+}
+export function disposeAllRepls() {
+  for (const k of replKernels.values()) k.dispose();
+  replKernels.clear();
+}
+
+export async function evalPythonRepl(agent, args, bridge = {}) {
+  const py = findPythonExecutable();
+  if (!py) return { ok: false, stdout: "", stderr: "Python 3 not found", result: null, variables: [], error: "Python 3 unavailable", text: "Error: Python 3 executable not found." };
+  const key = scopeKey("session", agent);
+  let kernel = replKernels.get(key);
+  if (!kernel) replKernels.set(key, (kernel = new ReplKernel(key, py)));
+  const context = extractSessionContext(agent);
+  context.store = loadReplStore(agent);
+
+  const handleRpc = async (method, params) => {
+    const defaultScope = loadConfig().defaultScope;
+    switch (method) {
+      case "harness.list": {
+        const entries = params.scope ? load(params.scope, agent) : loadAll(agent);
+        return (params.kind ? entries.filter((e) => (e.kind || "memory") === params.kind) : entries).map((e) => Object.assign({}, e, { ref: entryRef(e), kind: e.kind || "memory" }));
+      }
+      case "harness.add": {
+        const r = upsert(defaultScope, agent, params.text, "rlm", params.evidence || "recorded from python_repl", { kind: params.kind, name: params.name, pinned: params.pinned });
+        if (!r.ok) throw new Error(r.error);
+        return { ok: true, ref: r.ref, scope: r.scope, count: r.count };
+      }
+      case "harness.update": {
+        const r = updateEntry(defaultScope, agent, params.ref, params.text, params.evidence || "updated from python_repl", { kind: params.kind ?? undefined, name: params.name ?? undefined, pinned: typeof params.pinned === "boolean" ? params.pinned : undefined });
+        if (!r.ok) throw new Error(r.error);
+        return { ok: true, ref: r.ref, scope: r.scope, count: r.count };
+      }
+      case "harness.delete": {
+        const r = removeEntry(defaultScope, agent, params.ref);
+        if (!r.ok) throw new Error(r.error);
+        return { ok: true, ref: r.ref, scope: r.scope, count: r.count };
+      }
+      case "harness.snapshots":
+        return summarizeSnapshots(params.scope ? normalizeScope(params.scope, defaultScope) : defaultScope, agent);
+      case "harness.rollback": {
+        const r = rollbackSnapshot(params.scope ? normalizeScope(params.scope, defaultScope) : defaultScope, agent, params.ref);
+        if (!r.ok) throw new Error(r.error);
+        return { ok: true, ref: r.ref, scope: r.scope, restoredCount: r.restoredCount };
+      }
+      case "harness.diff": {
+        const r = diffSnapshot(params.scope ? normalizeScope(params.scope, defaultScope) : defaultScope, agent, params.ref);
+        if (!r.ok) throw new Error(r.error);
+        return { ok: true, ref: r.ref, scope: r.scope, lines: r.lines, text: r.text };
+      }
+      case "rlm.spawn": {
+        if (typeof bridge.spawnSubagent !== "function") throw new Error("subagent service unavailable");
+        let promptText = String(params.prompt || "");
+        if (params.role) {
+          const roleSpec = loadAll(agent).find((e) => e.kind === "subagent" && (e.name === params.role || entryRef(e) === params.role));
+          if (roleSpec) promptText = "[Subagent Role: " + (roleSpec.name || params.role) + "]\n" + roleSpec.text + "\n\n[Task]\n" + promptText;
+        }
+        return await bridge.spawnSubagent({ prompt: promptText, name: params.name || params.role || "rlm-subagent", model: params.model || undefined, provider: params.provider || undefined, fork: Boolean(params.fork), cwd: params.cwd || undefined });
+      }
+      case "rlm.list_subagents":
+        return typeof bridge.listSubagents === "function" ? await bridge.listSubagents() : [];
+      case "rlm.send_message":
+        if (typeof bridge.sendMessage !== "function") throw new Error("subagent messaging unavailable");
+        return await bridge.sendMessage(String(params.agent_id || ""), String(params.message || ""));
+      case "rlm.interrupt":
+        if (typeof bridge.interruptSubagent !== "function") throw new Error("subagent service unavailable");
+        return await bridge.interruptSubagent(String(params.agent_id || ""));
+      case "tool":
+        if (typeof bridge.callTool !== "function") throw new Error("tool bridge unavailable");
+        return await bridge.callTool(String(params.name || ""), params.args || {});
+      default:
+        throw new Error("unknown RLM RPC: " + method);
+    }
+  };
+
+  const timeoutMs = Number.isInteger(args.timeout_ms) && args.timeout_ms > 0 ? Math.min(args.timeout_ms, 600000) : 120000;
+  const outcome = await kernel.evaluate({ code: String(args.code || ""), reset: Boolean(args.reset), cwd: context.workspace, context, set_vars: args.set_vars && typeof args.set_vars === "object" ? args.set_vars : undefined }, handleRpc, timeoutMs);
+  if (outcome.store && typeof outcome.store === "object") saveReplStore(agent, outcome.store);
+  const parts = [];
+  if (outcome.stdout && outcome.stdout.trim()) parts.push(outcome.stdout.replace(/\n$/, ""));
+  if (outcome.result !== null && outcome.result !== undefined) parts.push(typeof outcome.result === "string" ? outcome.result : JSON.stringify(outcome.result, null, 2));
+  if (outcome.stderr && outcome.stderr.trim()) parts.push(outcome.stderr.replace(/\n$/, ""));
+  return {
+    ok: Boolean(outcome.ok),
+    stdout: String(outcome.stdout || ""),
+    stderr: String(outcome.stderr || ""),
+    result: outcome.result === undefined ? null : outcome.result,
+    variables: Array.isArray(outcome.variables) ? outcome.variables : [],
+    ...(outcome.error ? { error: String(outcome.error) } : {}),
+    text: parts.length > 0 ? parts.join("\n") : "(python_repl completed with no output)",
+  };
+}
+
 function isLoopback(req) {
   const remote = req.socket && req.socket.remoteAddress ? String(req.socket.remoteAddress) : "";
   return remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
 }
 
+function summarizeSnapshots(scope, agent) {
+  if (!agent) return [];
+  return loadSnapshots(scope, agent).slice().reverse().map((s) => ({
+    id: s.id,
+    ref: entryRef(s),
+    createdAt: s.createdAt,
+    reason: s.reason || "update",
+    beforeCount: s.beforeCount,
+    afterCount: s.afterCount,
+    diff: s.diff || { added: 0, updated: 0, deleted: 0 },
+  }));
+}
+
+function collectWorkspaces(ctx, active) {
+  const byKey = new Map();
+  const addCwd = (rawCwd, isCurrent = false) => {
+    if (typeof rawCwd !== "string" || !rawCwd.trim()) return;
+    let cwd;
+    try { cwd = path.resolve(rawCwd.trim()); } catch { return; }
+    const fakeAgent = { session: { id: (active && active.id) || "default", header: { cwd } } };
+    const key = scopeKey("workspace", fakeAgent);
+    const existing = byKey.get(key);
+    if (existing) {
+      if (isCurrent) existing.isCurrent = true;
+      return;
+    }
+    const entries = load("workspace", fakeAgent);
+    byKey.set(key, {
+      key,
+      cwd,
+      name: path.basename(cwd) || cwd,
+      isCurrent: Boolean(isCurrent),
+      count: entries.length,
+      entries,
+      ranked: rank(entries, fakeAgent).map((e) => e.id),
+      snapshots: summarizeSnapshots("workspace", fakeAgent),
+    });
+  };
+
+  if (active && active.cwd) addCwd(active.cwd, true);
+  for (const rec of lastActive.values()) if (rec && rec.cwd) addCwd(rec.cwd, Boolean(active && rec.cwd === active.cwd));
+
+  try {
+    const sessions = ctx && ctx.get ? ctx.get("sessions") : null;
+    if (sessions && typeof sessions.list === "function") {
+      for (const s of sessions.list()) if (s?.header?.cwd) addCwd(s.header.cwd, Boolean(active && path.resolve(s.header.cwd) === active.cwd));
+    }
+  } catch {}
+
+  try {
+    const agents = ctx && ctx.get ? ctx.get("agents") : null;
+    if (agents && typeof agents.roots === "function") {
+      for (const a of agents.roots()) if (a?.session?.header?.cwd) addCwd(a.session.header.cwd, Boolean(active && path.resolve(a.session.header.cwd) === active.cwd));
+    }
+  } catch {}
+
+  /* Also scan persisted DSH storages/workspaces and prime project-*.json files so
+   * every workspace appears on cold boot before any turn runs. */
+  try {
+    const storagesDir = path.join(homeDir(), "storages");
+    if (fs.existsSync(storagesDir)) {
+      for (const entry of fs.readdirSync(storagesDir, { withFileTypes: true })) {
+        const full = path.join(storagesDir, entry.name);
+        if (entry.isFile() && entry.name.endsWith(".json")) {
+          const raw = fs.readFileSync(full, "utf8");
+          for (const m of raw.matchAll(/"(?:cwd|path|root|directory)"\s*:\s*"([^"]+)"/g)) {
+            const candidate = m[1].replace(/\\\\/g, "\\");
+            if (path.isAbsolute(candidate) && fs.existsSync(candidate)) addCwd(candidate, Boolean(active && path.resolve(candidate) === active.cwd));
+          }
+        } else if (entry.isDirectory()) {
+          for (const sub of fs.readdirSync(full)) {
+            if (!sub.endsWith(".json")) continue;
+            const raw = fs.readFileSync(path.join(full, sub), "utf8");
+            for (const m of raw.matchAll(/"(?:cwd|path|root|directory)"\s*:\s*"([^"]+)"/g)) {
+              const candidate = m[1].replace(/\\\\/g, "\\");
+              if (path.isAbsolute(candidate) && fs.existsSync(candidate)) addCwd(candidate, Boolean(active && path.resolve(candidate) === active.cwd));
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+
+  try {
+    const dir = rootDir();
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.startsWith(LEGACY_SCOPE_PREFIX) || !f.endsWith(".json")) continue;
+        const key = f.slice(0, -5);
+        if (byKey.has(key)) continue;
+        const doc = readJson(path.join(dir, f), {});
+        if (typeof doc.cwd === "string" && doc.cwd.trim()) {
+          addCwd(doc.cwd, Boolean(active && path.resolve(doc.cwd) === active.cwd));
+        } else {
+          const entries = Array.isArray(doc.entries) ? doc.entries.filter((e) => e && typeof e.text === "string") : [];
+          if (!entries.length) continue;
+          byKey.set(key, {
+            key,
+            cwd: "",
+            name: "Workspace (" + key.replace(LEGACY_SCOPE_PREFIX, "").slice(0, 8) + ")",
+            isCurrent: false,
+            count: entries.length,
+            entries,
+            ranked: entries.map((e) => e.id),
+            snapshots: Array.isArray(doc.snapshots) ? doc.snapshots.slice().reverse().map((s) => ({
+              id: s.id,
+              ref: entryRef(s),
+              createdAt: s.createdAt,
+              reason: s.reason || "update",
+              beforeCount: s.beforeCount,
+              afterCount: s.afterCount,
+              diff: s.diff || { added: 0, updated: 0, deleted: 0 },
+            })) : [],
+          });
+        }
+      }
+    }
+  } catch {}
+
+  return [...byKey.values()].sort((a, b) => (Number(b.isCurrent) - Number(a.isCurrent)) || (b.count - a.count) || a.name.localeCompare(b.name));
+}
+
 function handleApi(ctx, req, res) {
   if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "POST only" });
-  /* The desktop shell loops back on both transports; anything else is rejected. */
   const host = typeof req.headers.host === "string" ? req.headers.host : "";
   const hostLocal = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host);
   if (!isLoopback(req) && !hostLocal) return sendJson(res, 403, { ok: false, error: "cross-origin request rejected" });
@@ -789,31 +1475,40 @@ function handleApi(ctx, req, res) {
     let req2 = {};
     try { req2 = raw.trim() ? JSON.parse(raw) : {}; } catch { return sendJson(res, 400, { ok: false, error: "invalid json" }); }
     const cfg = loadConfig();
-    /* Same alias handling as the command, so the panel and `/refine` cannot
-     * disagree about which harness a scope names. `global` normalises to the
-     * unknown bucket and therefore falls back to the configured default. */
     const scope = normalizeScope(req2.scope, cfg.defaultScope);
-    /* Both panel scopes are keyed by the session, so both need one. A synthetic
-     * agent carrying the resolved id and cwd is what `scopeKey` reads, which
-     * keeps one resolution rule for the command and the panel alike. With no
-     * session there is nothing honest to show, and the panel says so rather than
-     * listing an unrelated folder's entries. */
-    const active = resolveActiveSession(ctx);
-    const agent = active === null ? null : { session: { id: active.id, header: { cwd: active.cwd } } };
-    /* How many entries sit in EVERY layer, not just the one being listed. The panel
-     * shows one layer at a time while the agent reads all of them, so without this
-     * nothing on screen reveals that a second store holds anything — and an entry
-     * the operator cannot see is one they will report as lost. */
+    let active = resolveActiveSession(ctx);
+    if (typeof req2.sessionId === "string" && req2.sessionId.trim()) {
+      const wantId = req2.sessionId.trim();
+      try {
+        const s = ctx?.get?.("sessions")?.get?.(wantId) || ctx?.get?.("agents")?.get?.(wantId)?.session;
+        if (s && typeof s.id === "string") {
+          rememberSession(s);
+          active = { id: s.id, cwd: sessionCwd({ session: s }) };
+        }
+      } catch {}
+    }
+    const hasExplicitCwd = typeof req2.cwd === "string" && req2.cwd.trim().length > 0;
+    const targetCwd = hasExplicitCwd ? path.resolve(req2.cwd.trim()) : (active ? active.cwd : null);
+    const agent = (active === null && !hasExplicitCwd) ? null : {
+      session: {
+        id: (active && active.id) || "default",
+        header: { cwd: targetCwd || process.cwd() },
+      },
+    };
     const counts = {};
     for (const layer of SCOPES) counts[layer] = agent === null ? 0 : load(layer, agent).length;
-    const withActive = (payload) => Object.assign({ active, counts }, payload);
+    const withActive = (payload) => Object.assign({
+      active,
+      counts,
+      workspaces: collectWorkspaces(ctx, active),
+      snapshots: summarizeSnapshots(scope, agent),
+      repl: agent ? getReplStatus(agent) : null,
+    }, payload);
     switch (req2.op) {
       case "get": {
-        /* With no session to key by, reading `session-default` would report whatever
-         * an unrelated file happens to hold under the label of the current chat. */
-        if (agent === null) return sendJson(res, 200, withActive({ ok: true, config: cfg, scope, scopes: SCOPES, entries: [], ranked: [] }));
+        if (agent === null) return sendJson(res, 200, withActive({ ok: true, config: cfg, scope, scopes: SCOPES, kinds: KINDS, entries: [], ranked: [] }));
         const entries = load(scope, agent);
-        return sendJson(res, 200, withActive({ ok: true, config: cfg, scope, scopes: SCOPES, entries, ranked: rank(entries, agent).map((e) => e.id) }));
+        return sendJson(res, 200, withActive({ ok: true, config: cfg, scope, scopes: SCOPES, kinds: KINDS, entries, ranked: rank(entries, agent).map((e) => e.id) }));
       }
       case "setScope":
         return sendJson(res, 200, withActive({ ok: true, config: saveConfig({ defaultScope: scope }) }));
@@ -821,30 +1516,61 @@ function handleApi(ctx, req, res) {
         return sendJson(res, 200, withActive({ ok: true, config: saveConfig({ autoRefineOnCompact: !!req2.value }) }));
       case "add": {
         if (agent === null) return sendJson(res, 409, { ok: false, error: "no active session yet; open a chat first" });
-        /* The operator typing it into the panel IS the evidence, so record that
-         * rather than leaving the field absent on entries that have one. */
-        const r = upsert(scope, agent, req2.text, "ui", req2.evidence || "added from the settings panel");
+        const r = upsert(scope, agent, req2.text, "ui", req2.evidence || "added from the settings panel", { kind: req2.kind, name: req2.name, pinned: req2.pinned });
         counts[scope] = load(scope, agent).length;
-        return sendJson(res, r.ok ? 200 : 400, withActive(Object.assign({ ok: r.ok }, r, { entries: load(scope, agent) })));
+        const entries = load(scope, agent);
+        return sendJson(res, r.ok ? 200 : 400, withActive(Object.assign({ ok: r.ok }, r, { entries, ranked: rank(entries, agent).map((e) => e.id) })));
+      }
+      case "update": {
+        if (agent === null) return sendJson(res, 409, { ok: false, error: "no active session yet; open a chat first" });
+        const r = updateEntry(scope, agent, req2.ref || req2.id, req2.text, req2.evidence || "updated from the settings panel", { kind: req2.kind, name: req2.name, pinned: req2.pinned });
+        counts[scope] = load(scope, agent).length;
+        const entries = load(scope, agent);
+        return sendJson(res, r.ok ? 200 : 400, withActive(Object.assign({ ok: r.ok }, r, { entries, ranked: rank(entries, agent).map((e) => e.id) })));
+      }
+      case "pin": {
+        if (agent === null) return sendJson(res, 409, { ok: false, error: "no active session yet; open a chat first" });
+        const r = pinEntry(scope, agent, req2.ref || req2.id, Boolean(req2.pinned));
+        const entries = load(scope, agent);
+        return sendJson(res, r.ok ? 200 : 400, withActive(Object.assign({ ok: r.ok }, r, { entries, ranked: rank(entries, agent).map((e) => e.id) })));
       }
       case "remove": {
-        const entries = load(scope, agent).filter((e) => e.id !== req2.id);
-        save(scope, agent, entries);
-        return sendJson(res, 200, withActive({ ok: true, entries }));
+        if (agent !== null) {
+          removeEntry(scope, agent, req2.id || req2.ref);
+          counts[scope] = load(scope, agent).length;
+        }
+        const entries = agent === null ? [] : load(scope, agent);
+        return sendJson(res, 200, withActive({ ok: true, entries, ranked: agent === null ? [] : rank(entries, agent).map((e) => e.id) }));
       }
       case "clear": {
-        /* Clearing a scope that resolves to the wrong folder would delete the wrong
-         * memory, so an unresolved target is refused rather than guessed at. */
         if (agent === null) return sendJson(res, 409, { ok: false, error: "no active session yet; open a chat first" });
-        save(scope, agent, []);
-        return sendJson(res, 200, withActive({ ok: true, entries: [] }));
+        const prev = load(scope, agent);
+        save(scope, agent, [], prev.length > 0 ? { reason: "ui:clear", before: prev, diff: { added: 0, updated: 0, deleted: prev.length } } : undefined);
+        counts[scope] = 0;
+        return sendJson(res, 200, withActive({ ok: true, entries: [], ranked: [] }));
+      }
+      case "rollback": {
+        if (agent === null) return sendJson(res, 409, { ok: false, error: "no active session yet; open a chat first" });
+        const r = rollbackSnapshot(scope, agent, req2.ref || req2.id);
+        counts[scope] = load(scope, agent).length;
+        const entries = load(scope, agent);
+        return sendJson(res, r.ok ? 200 : 400, withActive(Object.assign({ ok: r.ok }, r, { entries, ranked: rank(entries, agent).map((e) => e.id) })));
+      }
+      case "diff": {
+        if (agent === null) return sendJson(res, 409, { ok: false, error: "no active session yet; open a chat first" });
+        const r = diffSnapshot(scope, agent, req2.ref || req2.id);
+        return sendJson(res, r.ok ? 200 : 400, withActive(r));
+      }
+      case "resetRepl": {
+        if (agent === null) return sendJson(res, 409, { ok: false, error: "no active session yet; open a chat first" });
+        resetPythonRepl(agent);
+        return sendJson(res, 200, withActive({ ok: true }));
       }
       default:
         return sendJson(res, 400, { ok: false, error: "unknown op" });
     }
   }).catch((e) => sendJson(res, 500, { ok: false, error: String((e && e.message) || e) }));
 }
-
 /* ---------- plugin ---------- */
 
 export function apply(ctx, config) {
@@ -913,6 +1639,7 @@ export function apply(ctx, config) {
     });
     return () => {
       if (typeof dispose === "function") dispose();
+      disposeAllRepls();
     };
   }, "prime: /prime/api route");
 }

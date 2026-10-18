@@ -19,16 +19,10 @@ agent is told to answer from them rather than re-derive what it already knows.
 
 | prime-agent | dsh-prime |
 |---|---|
-| Programmatic tool and subagent calls from code | **Same** — `await tools.<name>(args)` |
-| Persistent REPL: context lives in variables across calls | **Not built** — every program runs in a fresh Node process |
-| `rlm.spawn()` handles, replies over `agent_message` | Subagents are ordinary tools, callable from code |
-| Continual Harness: scoped, refined, versioned state | **Comparable** — two scopes, create/update/delete, evidence on every edit |
-
-The persistence gap is the honest one. `dsh-ptc-runtime-node` reports "each call
-runs in a fresh Node process", so nothing survives between calls; a persistent
-namespace would mean owning our own worker and diverging from DSH's per-call
-sandbox. It is deferred until a case needs it, not ruled out.
-
+| Programmatic tool and subagent calls from code | **Same** - `await tools.<name>(args)` in PTC + `tools.<name>(**kwargs)` in `python_repl` |
+| Persistent REPL: context lives in variables across calls | **Full** - `python_repl` keeps a persistent Python kernel per session with `ctx`, `messages`, and `store` variables |
+| `rlm.spawn()` handles, replies over `agent_message` | **Full** - `rlm.spawn()` / `await rlm(...)`, `rlm.list_subagents()`, `rlm.send_message()`, and `agent_message.send()` |
+| Continual Harness: scoped, refined, versioned state | **Full** - two scopes, 4 component kinds (`memory`, `prompt`, `skill`, `subagent`), create/update/delete/pin, evidence gate, and before/after snapshots with instant `--rollback` |
 Select it in Web/Desktop from the agent-preset picker, or make it the default by
 patching the profile:
 
@@ -145,6 +139,13 @@ filename that lags its label. The old `project` spelling still resolves to
 /refine workspace the daemon reads config from .dsh/prime
 /refine --list
 /refine --clear
+/refine --snapshots                        # list before/after snapshots
+/refine --rollback [<ref>]                 # roll back to the latest or named snapshot
+/refine --diff [<ref>]                     # inspect before/after diff of a pass
+/refine --pin <ref> / --unpin <ref>        # pin or unpin an entry by ref
+/refine --edit <ref> <new text>            # update an entry in place by ref
+/refine --delete <ref>                     # delete an entry by ref
+/refine --reset-repl                       # reset the session's persistent Python REPL
 ```
 
 A refinement pass queues exactly one turn; a second `/refine` before that turn
