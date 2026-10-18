@@ -43,13 +43,14 @@ export const SECTION_NAME = "prime:continual-harness";
 const HARNESS_INSTRUCTION = [
   "These are established facts recorded earlier in this work. Treat them as already verified: when one answers the operator's question, answer from it rather than re-deriving the answer from the code.",
   "Read the source only when nothing here covers the question, or when the code may have changed since the fact was recorded.",
-  "Each line starts with its 8-character ref. When an entry is wrong or no longer holds, UPDATE it by that ref or DELETE it — never record a second entry beside it. Two entries that disagree are worse than one that is stale.",
+  "Each line starts with its 8-character ref and optional [kind:name] tag: `memory` (default) is a verified fact, `[prompt]` is a standing behavioral rule you must obey on every turn, `[skill:name]` is a reusable workflow registered in the skill catalog, and `[subagent:name]` is a specialist role spec you can spawn with `rlm.spawn(task, role='name')` or apply when delegating.",
+  "When an entry is wrong or no longer holds, UPDATE it by that ref or DELETE it — never record a second entry beside it. Two entries that disagree are worse than one that is stale.",
   "Record durable facts with `harness_refine` in the same turn the operator states them — a preference, a correction, a constraint, a reusable tactic. Do not wait for `/refine` or for compaction: what stays only in the conversation is lost when the history is condensed.",
   /* The model does not choose a layer. It guessed badly when it did — a real
    * session split one sentence across both layers — and the choice belongs to the
    * operator anyway, who can see which memory they are looking at. */
   "You do not choose where a fact is stored; the operator does, and the line below says which layer is currently selected. You always READ both layers. You only WRITE to the selected one.",
-  "For stateful RLM exploration, context-as-a-variable (`ctx`, `messages`, `store`), or programmatic Python subagent and harness orchestration (`rlm.spawn`, `rlm.list_subagents`, `rlm.send_message`, `agent_message.send`, `rlm.harness`, `tools.*`), call `python_repl`.",
+  "For stateful RLM exploration, context-as-a-variable (`ctx`, `messages`, `store`), or programmatic Python subagent and harness orchestration (`rlm.spawn`, `rlm.list_subagents`, `rlm.send_message`, `agent_message.send`, `rlm.harness`, `tools.*`), call `await tools.python_repl({ code: '...' })` inside `run_code` (never write raw Python directly in `run_code`).",
 ].join(" ");
 const TOP_K = 12;
 const CHAR_BUDGET = 4000;
@@ -384,7 +385,9 @@ export function rank(entries, agent, extra) {
  */
 export function promptOrder(entries) {
   return entries.slice().sort((a, b) =>
-    (Number(!!b.pinned) - Number(!!a.pinned)) || (b.createdAt - a.createdAt));
+    (Number(!!b.pinned) - Number(!!a.pinned)) ||
+    (Number((b && b.kind) === "prompt") - Number((a && a.kind) === "prompt")) ||
+    (b.createdAt - a.createdAt));
 }
 
 /** @returns `YYYY-MM-DD` for an entry timestamp, or empty when unusable. */
@@ -728,7 +731,7 @@ function refinementPrompt(lead) {
     lead,
     "Decide first whether this conversation holds anything durable at all: an operator preference, a correction, a constraint, or a decision and its reason. Nothing is a normal answer — if the conversation was routine, say so and stop.",
     "Also sweep for durable facts that were never recorded, not only this decision's outcome.",
-    "If something is durable, make every edit in ONE call to `" + TOOL_NAME + "`. Each edit carries the evidence that prompted it; an edit without evidence is refused. Do not pass a scope — the operator selected the layer.",
+    "If something is durable, make every edit in ONE call to `" + TOOL_NAME + "`. Set `kind` appropriately: `memory` for facts/constraints, `prompt` for standing behavioral or routing rules, `skill` (with kebab-case `name`) for reusable procedures, or `subagent` (with kebab-case `name`) for reusable specialist roles. Each edit carries the evidence that prompted it; an edit without evidence is refused. Do not pass a scope — the operator selected the layer.",
     "If an entry is now wrong, UPDATE it by its ref, or DELETE it. Do not add a second entry beside it: two entries that disagree are worse than one that is stale.",
     "Prefer no edit over a speculative one, and do not restate anything already in the harness.",
     "Do not narrate this pass: reply with one line saying what you changed, or that nothing was durable.",
@@ -832,8 +835,24 @@ export function refine(rawInput, agent) {
     return ok("refining the " + scope + " harness; the result lands in /refine --list.");
   }
   if (body === "--help") return err(USAGE);
-  if (body.startsWith("--")) return err("refine: unknown flag " + body.split(/\s+/)[0] + "\n" + USAGE);
-  const r = upsert(scope, agent, body, "command");
+  let cmdKind = "memory";
+  let cmdName;
+  let noteBody = body;
+  while (noteBody.startsWith("--kind ") || noteBody.startsWith("--name ")) {
+    if (noteBody.startsWith("--kind ")) {
+      const m = /^--kind\s+(\S+)\s*([\s\S]*)$/.exec(noteBody);
+      if (!m || !KINDS.includes(m[1].toLowerCase())) return err("refine: --kind must be one of " + KINDS.join(", "));
+      cmdKind = m[1].toLowerCase();
+      noteBody = m[2].trim();
+    } else if (noteBody.startsWith("--name ")) {
+      const m = /^--name\s+(\S+)\s*([\s\S]*)$/.exec(noteBody);
+      if (!m) return err("refine: usage: /refine [--kind <kind>] [--name <name>] <note>");
+      cmdName = m[1].trim();
+      noteBody = m[2].trim();
+    }
+  }
+  if (noteBody.startsWith("--")) return err("refine: unknown flag " + noteBody.split(/\s+/)[0] + "\n" + USAGE);
+  const r = upsert(scope, agent, noteBody, "command", undefined, { kind: cmdKind, name: cmdName });
   if (!r.ok) return err("refine: " + r.error);
   return ok("recorded in " + scope + " harness (" + r.count + "/" + MAX_ENTRIES + ")");
 }

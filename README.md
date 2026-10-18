@@ -80,17 +80,7 @@ The agent writes through the `harness_refine` tool (or `rlm.harness.*` inside
 `python_repl`), never the slash command ? a slash command is operator-only, so
 the triggers below all name the tool.
 
-**The section asserts its own authority, and it has to.** The entries answer
-questions; a section that only explains how to *record* reads as a notebook, and
-one session proved the difference. Its composed system prompt contained, verbatim:
-
-> Clients tab bar is reserved exclusively for VPN client tabs; client-specific
-> controls (like the Residential vs Data Center pool switch) belong below the tab
-> section...
-
-and the agent still grepped the repository for the answer and read
-`ui/appwindow.slint`. Delivery was never the problem ? nothing had told it the
-entry was settled, so it treated a note as a lead to check. The section opens
+**The section asserts its own authority, and it has to.** The section opens
 with *"Treat them as already verified: when one answers the operator's question,
 answer from it rather than re-deriving the answer from the code"*, and says to
 read source only when nothing covers the question or the fact may have gone
@@ -102,8 +92,9 @@ because a preference that only lives in the conversation is gone once the
 history is condensed. The manual `/refine` command and post-compaction hook are
 backstops for what the eager path missed.
 
-**In-place correction by `ref`, component kinds, and snapshots.** Every rendered
-line starts with its 8-character `ref` handle and creation date:
+**In-place correction by `ref`, 4 component kinds, and snapshots.** Every rendered
+line starts with its 8-character `ref` handle, creation date, and optional
+`[kind:name]` tag:
 
 ```text
 - 31725ce5 [2026-10-17] [prompt:routing] Always declare Route: fast-path before routine edits.
@@ -114,10 +105,11 @@ When an entry is wrong or superseded, the model updates or deletes it by `ref`
 beside it. Every entry has one of four component kinds:
 
 - `memory` (default) ? durable facts, constraints, and findings.
-- `prompt` ? standing behavioral or routing rules.
-- `skill` ? reusable workflows that are dynamically registered into DSH's live
-  `skills` service (`prime-harness` provider) so `tool-skill` and `/` triggers
-  can invoke them immediately.
+- `prompt` ? standing behavioral or routing rules obeyed on every turn and
+  prioritized ahead of unpinned `memory` notes so routine facts never evict them.
+- `skill` ? reusable workflows dynamically registered into DSH's live `skills`
+  service (`prime-harness` provider) so `tool-skill` and `/` triggers can invoke
+  them immediately.
 - `subagent` ? reusable subagent role specifications that `rlm.spawn(..., role="<name|ref>")`
   automatically prepends to the spawned subagent's task prompt.
 
@@ -128,7 +120,7 @@ atomically so a pass is never half-written). Every mutation records a bounded
 diff counts, so any pass or edit can be inspected with `/refine --diff [<ref>]`
 and undone in one step with `/refine --rollback [<ref>]`.
 
-### Scopes
+### Scopes & CLI usage
 
 Two layers. The operator selects the write target in Settings ? **Prime Harness**,
 and **the agent never chooses**: everything it records goes to the selected
@@ -139,34 +131,22 @@ layer. It always *reads* both.
 | `session` (default) | this conversation only | `~/.dsh/prime/session-<id>.json` |
 | `workspace` | every session sharing this working directory | `~/.dsh/prime/project-<sha1(cwd)>.json` |
 
-`global` was removed: one machine-wide bucket shares a single store between every
-repository on the box, which is the opposite of scoped memory. Naming it is an
-error that says so and points at the old file, rather than a silent write into a
-layer nothing renders.
-
-The workspace store keeps its `project-` filename prefix so existing stores are
-never orphaned, and persists its resolved `cwd` metadata inside the JSON document
-so the Settings UI can list every workspace by name on cold boot. The old
-`project` spelling still resolves to `workspace`.
-
 ```text
-/refine                                    # refinement pass, default scope
-/refine workspace                          # refinement pass, workspace scope
+/refine                                            # refinement pass, default scope
+/refine workspace                                  # refinement pass, workspace scope
 /refine prefer composition over a new abstraction
-/refine workspace the daemon reads config from .dsh/prime
+/refine workspace --kind prompt always run checks before committing
+/refine workspace --kind skill --name lint-check Run npm run check before git commit.
 /refine --list
 /refine --clear
-/refine --snapshots                        # list before/after snapshots
-/refine --rollback [<ref>]                 # roll back to the latest or named snapshot
-/refine --diff [<ref>]                     # inspect before/after diff of a pass
-/refine --pin <ref> / --unpin <ref>        # pin or unpin an entry by ref
-/refine --edit <ref> <new text>            # update an entry in place by ref
-/refine --delete <ref>                     # delete an entry by ref
-/refine --reset-repl                       # reset the session's persistent Python REPL
+/refine --snapshots                                # list before/after snapshots
+/refine --rollback [<ref>]                         # roll back to the latest or named snapshot
+/refine --diff [<ref>]                             # inspect before/after diff of a pass
+/refine --pin <ref> / --unpin <ref>                # pin or unpin an entry by ref
+/refine --edit <ref> <new text>                    # update an entry in place by ref
+/refine --delete <ref>                             # delete an entry by ref
+/refine --reset-repl                               # reset the session's persistent Python REPL
 ```
-
-A refinement pass queues exactly one turn; a second `/refine` before that turn
-starts is refused, so repeated submission cannot stack duplicate passes.
 
 ### Ranking & prompt-cache stability
 
@@ -176,24 +156,10 @@ is weighted `3.0`, then the last four user/assistant speaker messages
 crowd out the operator's words) are weighted `2.0 / 1.5 / 1.0 / 1.0`, up to 48
 query terms, with `pinned` entries boosted by `+100`.
 
-In the system prompt, entry order is **pinned-first, then newest-first** (`promptOrder`)
-within a `topK = 12` / `4000`-character budget rather than query-reordered on
-every turn. Reordering the system prompt as the conversation moves invalidates
-the LLM KV-cache prefix on every step; `rank` drives `/refine --list` and the
-Settings UI, where re-ordering is free.
-
-### After compaction
-
-`session/event` ? `compaction/end` defers one microtask (so surface replacement
-settles first) and queues a follow-up refinement turn when `autoRefineOnCompact`
-is enabled, at least one operator turn has settled since the last pass, and the
-per-session 20-minute cooldown (`AutoRefineGates`) is open.
-
-**The hook is gated on the session's preset.** Because `/refine` is a root-plane
-command, its `session/event` listener sees every session in the process. `presetOf`
-reads the `agentPreset` session projection (falling back to
-`agentPresets.composedPreset(agent.ctx)`) so `/compact` in `standard`, `ptc`,
-`minimal`, or `cordis` never triggers a Prime refinement turn.
+In the system prompt, entry order is **pinned-first, then `prompt`-kind rules,
+then newest-first** (`promptOrder`) within a `topK = 12` / `4000`-character
+budget rather than query-reordered on every turn, keeping the LLM KV-cache
+prefix stable across steps. `rank` drives `/refine --list` and the Settings UI.
 
 ## Persistent Python REPL (`python_repl`)
 
@@ -260,32 +226,11 @@ Settings ? **Prime Harness** (registered by `client.js` using
 npm run check
 ```
 
-Three offline checks run in sequence:
-
 | Check | Covers |
 |---|---|
-| `test/self-check.mjs` | store round-trip, `/refine` flags (`--list`, `--clear`, `--snapshots`, `--rollback`, `--diff`, `--pin`/`--unpin`, `--edit`, `--delete`, `--reset-repl`), `harness_refine` batch/evidence/update/delete contract, `python_repl` persistent namespace + `store` + RLM subagent/tool/harness RPC bridge + dynamic `skills` provider, preset-gated post-compaction hook, `/prime/api` route end-to-end, and client bundle invariants |
+| `test/self-check.mjs` | store round-trip, `/refine` flags, `harness_refine` batch/evidence/update/delete contract, `python_repl` persistent namespace + `store` + RLM subagent/tool/harness RPC bridge + dynamic `skills` provider, preset-gated post-compaction hook, `/prime/api` route end-to-end, and client bundle invariants |
 | `test/validate-patch.mjs` | every row in `cordis.patch.yml` resolves against the installed DSH bundle tree, and both `harness_refine` and `python_repl` schemas pass `@deepseek-ai/dsh-tools`'s validators |
 | `test/scope-check.mjs` | scope isolation (`session` vs `workspace`), retired `project` and `global` spellings, deduplication, capacity cap, and goal/query-weighted ranking |
-
-To confirm the mode composes into the real Loader tree:
-
-```sh
-dsh --profile <name> --dump-config
-```
-
-## Notes on remaining boundaries
-
-1. **Agent Teams peer-roster vs programmatic subagents.** `@deepseek-ai/dsh-experimental-agent-team-profile`
-   double-registers `list_agents` and `interrupt_agent` against
-   `dsh-tool-subagent-control`. Prime delegates and messages subagents
-   programmatically from code (`rlm.spawn`, `rlm.send_message`, `agent_message.send`,
-   `subagent`, `subagent_fork`). To use the Agent Teams peer-roster UI instead,
-   drop `tool-subagent-control` and `tool-subagent-list-agents` from
-   `cordis.patch.yml` and mount `@deepseek-ai/dsh-experimental-agent-team-profile`.
-2. **User-defined quality gates on `/autonomous`.** DSH's `dsh-goal-round-driver`
-   and `dsh-tool-ralph` enforce round budgets (`maxRounds: 64`) without a
-   user-defined shell gate hook.
 
 ## Layout
 

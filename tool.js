@@ -36,6 +36,7 @@ import {
   recordPassSnapshot,
   registerSkillsInvalidator,
   removeEntry,
+  resolveActiveSession,
   render,
   resetPythonRepl,
   updateEntry,
@@ -62,6 +63,7 @@ const DESCRIPTION =
   "Maintain the continual harness: durable findings that survive compaction and reach future sessions. " +
   "Send every edit of one pass in a SINGLE call — this tool takes an array — never one call per edit. " +
   "Every edit needs the evidence that prompted it: the operator's words, or what you observed. " +
+  "Choose the right `kind`: `memory` (default) for durable facts/constraints, `prompt` for standing behavioral rules, `skill` (with `name`) for reusable workflows, or `subagent` (with `name`) for specialist delegate roles. " +
   "When an entry is wrong or no longer holds, UPDATE it by its ref, or DELETE it. Never add a second entry beside a wrong one: two entries that disagree are worse than one that is stale. " +
   "Do NOT pass a scope: the operator selects the memory layer, and the prompt section reports which one is active. " +
   "Prefer no edit over a speculative one, and never restate the current task or repeat what the harness already says.";
@@ -99,8 +101,11 @@ export function apply(ctx) {
         registerSkillsInvalidator(() => control.invalidate());
         const providerName = "prime-harness";
         const buildCandidates = (options) => {
-          const cwd = (options && options.cwd) || process.cwd();
-          const scopeAgent = (options && options.scope) || { session: { id: "default", header: { cwd } } };
+          const active = resolveActiveSession(ctx);
+          const cwd = (options && options.cwd) || (active && active.cwd) || process.cwd();
+          const scopeAgent = (options && options.scope && options.scope.session)
+            ? options.scope
+            : { session: { id: (options && options.sessionId) || (active && active.id) || "default", header: { cwd } } };
           return loadAll(scopeAgent).filter((e) => e && e.kind === "skill" && e.text).map((e) => {
             const rawSlug = String(e.name || e.text.split(/[:.\n]/)[0] || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
             const sName = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(rawSlug) ? rawSlug : "prime-skill-" + entryRef(e);
