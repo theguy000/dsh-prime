@@ -675,13 +675,13 @@ disabled: busy
 ),
 h("div", { className: "dp-group-row" },
 h("div", { className: "dp-group-info" },
-h("span", { className: "dp-group-title" }, "Auto-refine after compaction"),
-h("span", { className: "dp-group-desc" }, "Queue a background refinement pass when conversation history is compacted.")
+h("span", { className: "dp-group-title" }, "Auto-refine before compaction"),
+h("span", { className: "dp-group-desc" }, "Fork a refinement pass over the full history when the conversation is about to be compacted.")
 ),
 h(Switch, {
 checked: cfg.autoRefineOnCompact !== false,
 onChange: onAuto,
-label: "Auto-refine after context compaction"
+label: "Auto-refine before context compaction"
 })
 ),
 state.repl && state.repl.active ? h("div", { className: "dp-group-row" },
@@ -805,6 +805,97 @@ return catalog !== undefined && catalog.length > 0 && catalog.every((entry) => R
 });
 }
 
+/* ---- Pass outcomes on the rows ------------------------------------------
+ *
+ * `harness_refine` already answers in structure - { recorded, updated,
+ * deleted } - and every snapshot it writes names the child session that wrote
+ * it, so /prime/api can total one pass. No prose is parsed and nothing is
+ * guessed: a pass that wrote nothing has no snapshot and keeps its time label.
+ *
+ * The row title is `entry.label`, frozen when the child was catalogued, so the
+ * only place the counts can go is the client. The shipped dropdown gets a
+ * `useSessions` that serves a state whose catalog labels are rewritten; the
+ * dressed state is cached by identity because useSyncExternalStore compares
+ * snapshots with Object.is. */
+function passLabel(counts) {
+const recorded = counts.recorded || 0;
+const updated = counts.updated || 0;
+const deleted = counts.deleted || 0;
+return recorded + updated + deleted === 0 ? undefined : "+" + recorded + " ~" + updated + " -" + deleted;
+}
+
+function fetchPassLabels(sessionId) {
+return fetch(API, {
+method: "POST",
+headers: { "content-type": "application/json" },
+body: JSON.stringify({ op: "passes", sessionId })
+}).then((response) => (response.ok ? response.json() : null)).then((data) => {
+const labels = {};
+const passes = data && data.passes ? data.passes : {};
+for (const id of Object.keys(passes)) {
+const label = passLabel(passes[id] || {});
+if (label !== undefined) labels[id] = label;
+}
+return labels;
+}).catch(() => ({}));
+}
+
+/* Rewrite only the labels; every other part of the state keeps its identity. */
+function dressLabels(state, labels) {
+const projections = state.projectionsBySession;
+if (projections === undefined) return state;
+let changed = false;
+const next = {};
+for (const id of Object.keys(projections)) {
+const snapshot = projections[id];
+const catalog = snapshot && snapshot.values ? snapshot.values.subagentCatalog : undefined;
+if (!Array.isArray(catalog)) {
+next[id] = snapshot;
+continue;
+}
+let touched = false;
+const entries = catalog.map((entry) => {
+const label = labels[entry.id];
+if (label === undefined || label === entry.label) return entry;
+touched = true;
+return { ...entry, label };
+});
+next[id] = touched ? { ...snapshot, values: { ...snapshot.values, subagentCatalog: entries } } : snapshot;
+changed = changed || touched;
+}
+return changed ? { ...state, projectionsBySession: next } : state;
+}
+
+/* Fetch once per catalog/running change: a pass's counts only exist after it
+ * settles, and the status map is the only thing that changes at that moment. */
+function usePassLabels(useSessions, useSessionStatus, sessionId) {
+const [labels, setLabels] = React.useState({});
+const catalog = useSessions((state) => {
+const snapshot = state.projectionsBySession[sessionId];
+const entries = snapshot === undefined ? undefined : snapshot.values.subagentCatalog;
+return entries === undefined ? "" : entries.map((entry) => entry.id).join(",");
+});
+const running = useSessionStatus((value) => {
+const ids = [];
+for (const [id, status] of value) if (status && status.running) ids.push(id);
+return ids.sort().join(",");
+});
+React.useEffect(() => {
+if (catalog === "") {
+setLabels({});
+return undefined;
+}
+let live = true;
+fetchPassLabels(sessionId).then((next) => {
+if (live) setLabels(next);
+});
+return () => {
+live = false;
+};
+}, [sessionId, catalog, running]);
+return labels;
+}
+
 /* One pass-through replacement for one pill cell.
  *
  * Errors are caught HERE, inside our own boundary, and never forwarded: an
@@ -829,6 +920,20 @@ function PillBody(props) {
 const sessionId = sessionOf(props);
 const onlyRefines = useOnlyRefines(props.useSessions, sessionId);
 const words = React.useMemo(() => (onlyRefines ? refineWords(props.t) : props.t), [props.t, onlyRefines]);
+const labels = usePassLabels(props.useSessions, props.useSessionStatus, sessionId);
+const cache = React.useRef(undefined);
+/* Only wrap when there is something to substitute, so the common case stays
+ * the shipped hook with no extra work per render. */
+const sessions = React.useMemo(() => {
+if (Object.keys(labels).length === 0) return props.useSessions;
+return (selector) => props.useSessions((state) => {
+const hit = cache.current;
+if (hit !== undefined && hit.raw === state && hit.labels === labels) return selector(hit.dressed);
+const dressed = dressLabels(state, labels);
+cache.current = { raw: state, labels, dressed };
+return selector(dressed);
+});
+}, [props.useSessions, labels]);
 let shipped;
 let broken;
 try {
@@ -839,7 +944,7 @@ broken = (error && error.message) || String(error);
 if (broken !== undefined) return h("span", { className: "dp-pill-broken" }, "prime pill: " + broken);
 if (shipped === undefined) return h("span", { className: "dp-pill-broken" }, "prime pill: no entry in " + slot);
 const injected = typeof shipped.inject === "function" ? shipped.inject(sessionId) : undefined;
-return h(shipped.component, { ...injected, ...props, t: words });
+return h(shipped.component, { ...injected, ...props, useSessions: sessions, t: words });
 }
 function PrimePill(props) {
 return h(PillBoundary, null, h(PillBody, props));

@@ -152,6 +152,7 @@ not the catalog entry — so passes are already visible there. The label carries
 the time, making that list a pass history.
 
 **The header pill says "refines", not "subagents".** The catalog pill in the session header is one cell of `conversation.session.header.actions` (`id: "subagent-catalog"`), and its count text lives in `@deepseek-ai/dsh-client-ui-subagent`'s own dictionary — `locale.register` refuses a second one, so the words cannot be patched. `client.js` re-registers that cell at `priority: -1` instead: a list slot elects the lowest priority per id, so the replacement takes the cell over, renders the shipped component from `slots.entries`, forwards every prop (including its `inject` face) and swaps only `t`. The wording changes only while every direct child carries the host's `refine HH:MM` label; one real subagent among them restores "N subagents".
+Row titles come from the same override: `harness_refine` answers in structure (`recorded`/`updated`/`deleted`), each snapshot it writes records the child session that wrote it, and `/prime/api {op: "passes"}` totals them per pass, so a finished pass is listed as `+3 ~1 -0` instead of its start time. Nothing is parsed from prose, and a pass that wrote nothing keeps its time label.
 
 **The row reports what actually happened, not that the child returned.** A child
 that ends normally without recording anything is a success by `stopReason` and a
@@ -165,10 +166,14 @@ header records `parentSession`, and `storeSessionId` follows it back. Without
 that, every finding landed in a file nobody reads — a silent loss, because the
 write itself succeeds.
 
-**Two paths stay in-process.** Flag queries never start an agent. The
-post-compaction hook keeps its own in-turn pass, because a fork's seed stops at
-the last `turn/end` and that hook fires immediately after a compaction replaces
-the surface. It carries `source: { kind: "prime-refine" }`, not `user`, so Chat
+**Two paths stay in-process.** Flag queries never start an agent. The automatic
+pass forks on `compaction/start` — before the summarization call replaces the
+surface — so the child is seeded with the history the compaction is about to
+replace, not the checkpoint it leaves behind. The seed is the completed-turn
+prefix: the in-progress turn is excluded because an unbalanced turn cannot be
+replayed as a child session, and the parent is not delayed while the child runs.
+The in-turn `followup` path survives only for `/refine` in a profile with no fork
+provider. It carries `source: { kind: "prime-refine" }`, not `user`, so Chat
 draws the collapsed turn-trigger notice rather than an operator bubble and
 `isSpeaker` stops reading its boilerplate as the operator's own words. It is
 bound to the exact turn it opens, so an operator turn settling while it is queued
@@ -183,7 +188,8 @@ covers the question or the fact may have gone stale. The heading is
 **Capture is eager, not a rescue.** The prompt section carries a standing
 instruction to record a durable fact in the same turn the operator states it. A
 preference that only lives in the conversation is gone once the history is
-condensed; the manual command and the post-compaction hook are backstops.
+condensed; the manual command and the pre-compaction pass are backstops, and the
+pass only runs when the session has taken 15 model steps since the last one.
 
 </details>
 
@@ -260,7 +266,7 @@ Only `dsh-prime` is new code; the rest is composition of shipped packages.
 |:--|:--|:--|
 | "Everything is programmatic" — the model tool is a persistent REPL | `dsh-agent-tool-presentation` (`mode: native`), `dsh-tool-workflow` over `dsh-workflow-ptc`, a persistent shell (`dsh-tool-bash-persistent` / `dsh-tool-pwsh-persistent`), **plus** `python_repl` — a stateful per-session Python 3 RLM kernel with `ctx`, `messages`, `store`, `rlm.*`, and `tools.*` | **Full** |
 | `rlm.spawn(...)` subagents returning results programmatically | `dsh-tool-subagent` (`provider: spawn`) + `dsh-tool-subagent-fork` (`provider: fork`) + `python_repl`'s `rlm.spawn(..., role=...)` / `rlm.send_message` / `agent_message.send` | **Full** |
-| `/refine` — harness improves itself, base prompt immutable, snapshots roll back | **`dsh-prime`** (this plugin): durable store + `/refine` command + `harness_refine` tool + 4 component kinds + in-place update/delete/pin by `ref` + before/after snapshots with inline diff and one-click rollback in **Settings → Prime Harness** + post-compaction auto-refine | **Full** |
+| `/refine` — harness improves itself, base prompt immutable, snapshots roll back | **`dsh-prime`** (this plugin): durable store + `/refine` command + `harness_refine` tool + 4 component kinds + in-place update/delete/pin by `ref` + before/after snapshots with inline diff and one-click rollback in **Settings → Prime Harness** + pre-compaction auto-refine (15-step floor) | **Full** |
 | Skills are executable packages; skill creator | `dsh-skill-filesystem` + `dsh-tool-skill` + the dynamic `prime-harness` skill provider exposing `kind: "skill"` entries to the live catalog | **Full** |
 | Sessions run in the background; reattach later | `dsh-jobs-local` + `dsh-tool-jobs` + session persistence; children outlive their parent turn | **Partial** — no detach/reattach outside the app |
 | Agents communicate directly | `rlm.send_message` / `agent_message.send` + `dsh-tool-subagent-control`; `dsh-experimental-agent-team` is available if the peer-roster UX is preferred | **Full** (see note 1) |
@@ -309,7 +315,7 @@ ALL PRIME CHECKS PASSED
 
 | Check | Covers |
 |:--|:--|
-| `test/self-check.mjs` | store round-trip, `/refine` flags, the `harness_refine` batch/evidence/update/delete contract, the `python_repl` namespace + `store` + RLM subagent/tool/harness RPC bridge + dynamic `skills` provider, the preset-gated post-compaction hook, `/prime/api` end to end, and client bundle invariants |
+| `test/self-check.mjs` | store round-trip, `/refine` flags, the `harness_refine` batch/evidence/update/delete contract, the `python_repl` namespace + `store` + RLM subagent/tool/harness RPC bridge + dynamic `skills` provider, the preset-gated pre-compaction fork, `/prime/api` end to end, and client bundle invariants |
 | `test/validate-patch.mjs` | every row in `cordis.patch.yml` resolves against the installed DSH bundle tree; both `harness_refine` and `python_repl` schemas pass `@deepseek-ai/dsh-tools`'s validators |
 | `test/scope-check.mjs` | scope isolation (`session` vs `workspace`), retired `project`/`global` spellings, deduplication, the capacity cap, and goal/query-weighted ranking |
 

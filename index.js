@@ -55,8 +55,11 @@ const HARNESS_INSTRUCTION = [
 const TOP_K = 12;
 const CHAR_BUDGET = 4000;
 const API_PATH = "/prime/api";
-/* prime-agent AutoRefineGates: compact: true, cooldown 20 min. */
-const COOLDOWN_MS = 20 * 60 * 1000;
+/* Model steps a session must add between automatic passes. A step is one model
+ * request, so this counts work actually done rather than wall-clock time — 15 is
+ * roughly where the new material is worth re-reading the context for. Below it a
+ * pass re-reads the conversation the previous pass just read. */
+export const MIN_STEPS = 15;
 /* Two scopes only. `global` was dropped: a machine-wide layer shares one
  * bucket between every repository on the box, and the operator's own words for
  * the middle layer are "workspace", not "project". `workspace` means every
@@ -195,6 +198,7 @@ export function save(scope, agent, entries, snapshotMeta) {
       reason: String(snapshotMeta.reason || "update"), beforeCount: snapshotMeta.before.length,
       afterCount: Array.isArray(entries) ? entries.length : 0,
       diff: snapshotMeta.diff || computeDiffCounts(snapshotMeta.before, entries),
+      ...(snapshotMeta.child ? { child: snapshotMeta.child } : {}),
       before: cloneEntries(snapshotMeta.before), after: cloneEntries(entries),
     });
     while (next.length > MAX_SNAPSHOTS) next.shift();
@@ -648,7 +652,8 @@ export function recordPassSnapshot(scope, agent, beforeEntries, reason) {
   const current = load(scope, agent);
   const diff = computeDiffCounts(beforeEntries, current);
   if (!diff.added && !diff.updated && !diff.deleted) return null;
-  save(scope, agent, current, { reason: reason || ("pass (+" + diff.added + " ~" + diff.updated + " -" + diff.deleted + ")"), before: beforeEntries, diff });
+  const child = agent && agent.session && typeof agent.session.id === "string" ? agent.session.id : undefined;
+  save(scope, agent, current, { reason: reason || ("pass (+" + diff.added + " ~" + diff.updated + " -" + diff.deleted + ")"), before: beforeEntries, diff, child });
   return loadSnapshots(scope, agent).at(-1) || null;
 }
 export function findSnapshot(snapshots, ref) {
@@ -743,7 +748,7 @@ const refining = new Set();
  * lands immediately, and the row claims "refining…" while a second, unrelated
  * turn does the actual work below it.
  *
- * Registered for every pass, including the post-compaction hook's: an unawaited
+ * Registered for every pass, including the automatic pre-compaction one's: an unawaited
  * promise costs nothing, and making the registration conditional would put the
  * "am I awaited?" decision at the call site that is most likely to forget it. */
 const refineWaiters = new Map();
@@ -759,7 +764,7 @@ const refineTurns = new Map();
 
 /**
  * The instruction behind both triggers — `/refine` with no note, and the
- * post-compaction hook. Recording goes through `TOOL_NAME` because the agent
+ * pre-compaction fork. Recording goes through `TOOL_NAME` because the agent
  * cannot run slash commands; only the operator can.
  * @returns the message text for one refinement turn.
  */
@@ -795,8 +800,11 @@ function queueRefinement(agent, lead) {
   /* Claim the slot BEFORE queueing. `followup` wakes the driver synchronously,
    * so the turn it opens appends `turn/start` and can settle inside this call —
    * claiming afterwards leaves the guard set forever and every later `/refine`
-   * and every post-compaction pass is refused. */
+   * and every automatic pass is refused. */
   refining.add(key);
+  /* This pass covers the conversation up to now, so the automatic floor starts
+   * again from zero. */
+  stepsSincePass.set(key, 0);
   /* Always registered: whether anyone awaits it is the caller's business, and an
    * unawaited promise costs nothing. Registering only for operator invocations
    * would mean the hook has to say so, and the hook is the caller that forgets. */
@@ -872,7 +880,7 @@ function forkService(ctx) {
  * child's — `storeSessionId` resolves through the child header's `parentSession`.
  * @returns a settled `CommandResult` for the command row.
  */
-async function runForkedPass(ctx, agent, signal, scope) {
+async function runForkedPass(ctx, agent, signal, scope, lead = "Refine the continual harness now: review this conversation and record what should outlive it.") {
   const subagents = forkService(ctx);
   if (!subagents) return err("refine: the fork subagent provider is unavailable in this profile");
   /* The fork does not open a turn, so the `turn/end` re-arm never fires for it —
@@ -880,6 +888,10 @@ async function runForkedPass(ctx, agent, signal, scope) {
   const key = scopeKey("session", agent);
   if (refining.has(key)) return err("refine: a refinement pass is already queued for this session");
   refining.add(key);
+  /* A pass covers everything up to now, so the next automatic one starts its
+   * budget from zero. Manual passes count: a `/refine` two steps before a
+   * compaction must not be followed by a second look at the same conversation. */
+  stepsSincePass.set(key, 0);
   /* Read the baseline BEFORE the child can write. A child that ends normally
    * without recording anything is a success by `stopReason` and a lie by
    * outcome; comparing snapshots is what makes the row report the difference. */
@@ -895,7 +907,7 @@ async function runForkedPass(ctx, agent, signal, scope) {
       label: "refine " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }),
       request: {
         parent: agent,
-        prompt: [{ type: "text", text: refinementPrompt("Refine the continual harness now: review this conversation and record what should outlive it.") }],
+        prompt: [{ type: "text", text: refinementPrompt(lead) }],
       },
       signal,
       delivery: "caller",
@@ -1008,17 +1020,10 @@ export function refine(rawInput, agent) {
 
 /* ---------- compaction ---------- */
 
-/** Last auto-refine per session. Session-keyed, not process-wide: the hook is
- *  reached by every session in the process, and one session compacting must not
- *  spend another session's cooldown. */
-const lastAutoRefine = new Map();
-
-/* Operator turns settled since the last refinement pass, per session. prime-agent
- * reviews before refining so a pass only runs when something changed; this is the
- * cheap half of that — a pass is never queued onto a conversation that has said
- * nothing new since the previous one, which would spend a whole turn to discover
- * nothing was durable. */
-const settledTurns = new Map();
+/* Model steps taken since the last refinement pass, per session. Session-keyed,
+ * not process-wide: the hook is reached by every session in the process, and one
+ * session compacting must not spend another session's budget. */
+const stepsSincePass = new Map();
 
 /**
  * The preset this session actually runs, read through the registry's own
@@ -1049,13 +1054,20 @@ export function presetOf(ctx, agent, session) {
   } catch { return null; }
 }
 
-/** Whether this session's cooldown window has elapsed. */
-function cooldownOpen(key) {
-  const last = lastAutoRefine.get(key);
-  return last === undefined || Date.now() - last >= COOLDOWN_MS;
-}
-
-/** Post-compaction hook: re-rank the harness and let the model refine it without a user turn. */
+/**
+ * Pre-compaction hook: fork one refinement pass over the conversation that is
+ * about to be condensed.
+ *
+ * Fires on `compaction/start`, which the engine appends before it makes the
+ * summarization call. The fork's seed is the completed-turn prefix, so the child
+ * reads the history the compaction is about to replace rather than the checkpoint
+ * it leaves behind. The parent is not delayed: the child runs beside the
+ * summarization and writes through `parentSession` into this session's store.
+ *
+ * The fork is the only path. Without it there is no pre-compaction read, and an
+ * in-turn followup would refine the post-compaction history — the exact loss this
+ * hook exists to avoid — so a profile that cannot fork skips the pass and says so.
+ */
 export function onCompaction(ctx, session) {
   const cfg = loadConfig();
   if (!cfg.autoRefineOnCompact) return;
@@ -1067,33 +1079,38 @@ export function onCompaction(ctx, session) {
   /* Only the preset that mounts the harness may be refined. This hook lives on
    * the root plane because the command does, and a root listener is reached by
    * every session in the process: without this check, `/compact` in `standard`,
-   * `ptc`, or `minimal` injected a refinement turn into a mode that has no
-   * harness digest and no `harness_refine` tool to record with. */
+   * `ptc`, or `minimal` forked a pass into a mode with no harness digest and no
+   * `harness_refine` tool to record with. */
   if (preset === null) {
     ctx.logger.warn("prime: auto-refine skipped; the session preset could not be resolved (no agentPreset projection)");
     return;
   }
   if (preset !== PRESET_ID) return;
-  if (!agent || typeof agent.followup !== "function") return;
-  const key = scopeKey("session", agent);
-  if (!cooldownOpen(key)) return;
-  /* The gate: nothing the operator said since the last pass means there is nothing
-   * new to be durable about. A manual `/refine` skips this deliberately — the
-   * operator asking for a pass is reason enough. */
-  if ((settledTurns.get(key) || 0) === 0) return;
-  settledTurns.set(key, 0);
-  /* Spend the window before queueing: `followup` runs the turn's opening events
-   * synchronously, so a compaction that lands during the queue would otherwise
-   * re-enter here with the old timestamp still open. */
-  lastAutoRefine.set(key, Date.now());
-  /* Each session's entry is bounded below; nothing else prunes this map. */
-  if (lastAutoRefine.size > 256) {
-    for (const [k, at] of lastAutoRefine) if (Date.now() - at >= COOLDOWN_MS) lastAutoRefine.delete(k);
+  if (!agent) return;
+  if (!forkService(ctx)) {
+    ctx.logger.warn("prime: auto-refine skipped; the `fork` subagent provider is not mounted");
+    return;
   }
-  /* Shares the `/refine` path, so the two triggers cannot drift apart. */
-  const queued = queueRefinement(agent, "[prime auto-refine] Context was compacted.");
-  /* A skipped pass is otherwise invisible; this is the only trace it leaves. */
-  if (!queued.ok) ctx.logger.warn("prime: post-compaction refinement not queued: " + queued.error);
+  const key = scopeKey("session", agent);
+  if (refining.has(key)) return;
+  /* The floor: fewer model steps than this means the new material is not worth
+   * re-reading the whole context for. A manual `/refine` skips it deliberately —
+   * the operator asking is reason enough — and resets it. */
+  if ((stepsSincePass.get(key) || 0) < MIN_STEPS) return;
+  /* ponytail: a compaction during a session's very first turn forks an empty
+   * seed (the fork provider stops at the last `turn/end`), so that child finds
+   * nothing durable and costs one spawn. Guard on a `turn/end` in the log if a
+   * first-turn compaction ever shows up in real use. */
+  /* Spend the budget before forking: the fork's opening events land synchronously,
+   * so a compaction that re-entered here would otherwise fork a second pass. */
+  stepsSincePass.set(key, 0);
+  void runForkedPass(ctx, agent, undefined, "session", "[prime auto-refine] The conversation is about to be compacted.")
+    .then((result) => {
+      if (result && result.kind === "error") ctx.logger.warn("prime: " + result.text);
+    })
+    .catch((error) => {
+      ctx.logger.warn("prime: auto-refine failed: " + ((error && error.message) || String(error)));
+    });
 }
 
 /* ---------- http bridge (kept dependency-free, same shape as dsh-purge) ---------- */
@@ -1522,6 +1539,7 @@ function summarizeSnapshots(scope, agent) {
     beforeCount: s.beforeCount,
     afterCount: s.afterCount,
     diff: s.diff || { added: 0, updated: 0, deleted: 0 },
+    ...(s.child ? { child: s.child } : {}),
   }));
 }
 
@@ -1677,6 +1695,25 @@ function handleApi(ctx, req, res) {
         if (agent === null) return sendJson(res, 200, withActive({ ok: true, config: cfg, scope, scopes: SCOPES, kinds: KINDS, entries: [], ranked: [] }));
         const entries = load(scope, agent);
         return sendJson(res, 200, withActive({ ok: true, config: cfg, scope, scopes: SCOPES, kinds: KINDS, entries, ranked: rank(entries, agent).map((e) => e.id) }));
+      }
+      /* Per-child totals for the header pill: a pass is one child session, and
+       * every snapshot it wrote names it. Both scopes count because a pass may
+       * write to the workspace layer while the panel is set to the session one. */
+      case "passes": {
+        const passes = {};
+        if (agent !== null) {
+          for (const layer of SCOPES) {
+            for (const snap of loadSnapshots(layer, agent)) {
+              if (typeof snap.child !== "string" || !snap.child) continue;
+              const acc = passes[snap.child] || (passes[snap.child] = { recorded: 0, updated: 0, deleted: 0 });
+              const diff = snap.diff || {};
+              acc.recorded += diff.added || 0;
+              acc.updated += diff.updated || 0;
+              acc.deleted += diff.deleted || 0;
+            }
+          }
+        }
+        return sendJson(res, 200, { ok: true, passes });
       }
       case "setScope":
         return sendJson(res, 200, withActive({ ok: true, config: saveConfig({ defaultScope: scope }) }));
@@ -1887,6 +1924,21 @@ export function apply(ctx, config) {
     rememberSession(session);
     if (!windowsSandboxPatched) ensureWindowsSandboxRunner(ctx);
     if (!event) return;
+    /* The automatic floor counts model steps, not turns or wall time: one step is
+     * a grep or a file read, so it measures how much conversation was actually
+     * added. A delegated child reports its own steps under `parentSession`, and
+     * `scopeKey` folds those into the parent — counting them would let a pass pay
+     * for itself, so a child never counts. */
+    if (event.type === "step/end") {
+      if (session.header && session.header.parentSession) return;
+      const key = scopeKey("session", { session });
+      if (refining.has(key)) return;
+      stepsSincePass.set(key, (stepsSincePass.get(key) || 0) + 1);
+      /* A long-lived process sees every session's events; drop the oldest counter
+       * once the map outgrows what a session can plausibly remember. */
+      if (stepsSincePass.size > 256) stepsSincePass.delete(stepsSincePass.keys().next().value);
+      return;
+    }
     /* Bind a pass to the exact turn it opens. The first `turn/start` after the
      * message was queued is that turn: `followup` either wakes the driver with
      * it or parks it as the next turn, and nothing else may interleave. */
@@ -1899,14 +1951,6 @@ export function apply(ctx, config) {
      * `turn/start` would clear the slot before the pass had even run. */
     if (event.type === "turn/end") {
       const key = scopeKey("session", { session });
-      /* A turn ending while a pass is in flight IS the pass. Every other settled
-       * turn is the operator's, and only those justify another pass. */
-      if (!refining.has(key)) {
-        settledTurns.set(key, (settledTurns.get(key) || 0) + 1);
-        if (settledTurns.size > 256) {
-          for (const [k, n] of settledTurns) if (n === 0) settledTurns.delete(k);
-        }
-      }
       const passTurn = refineTurns.get(key);
       const endedTurn = event.data && event.data.turn;
       const isPass = refining.has(key) && (passTurn === undefined || passTurn === endedTurn);
@@ -1917,8 +1961,11 @@ export function apply(ctx, config) {
       if (isPass) releaseRefinement(key);
       return;
     }
-    if (event.type !== "compaction/end") return;
-    /* surface replacement lands after compaction/end; defer one microtask batch. */
+    if (event.type !== "compaction/start") return;
+    /* `compaction/start` lands before the summarization call, while the surface
+     * still holds the full conversation — that is the whole reason this hook is on
+     * `start` and not `end`. Defer a microtask so the fork is not seeded from
+     * inside the event's own append stack. */
     Promise.resolve().then(() => {
       try { onCompaction(ctx, session); } catch { /* never break the event feed */ }
     });

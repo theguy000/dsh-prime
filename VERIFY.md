@@ -170,10 +170,11 @@ Three things to confirm:
    different. The conversation list still shows step 4's note; the workspace
    list shows only the new one. Each row prints its 8-character ref, its date,
    and the evidence behind it.
-6. Trigger a compaction. A `[prime auto-refine]` follow-up appears **only if you
-   have said something since the last pass** and the 20-minute per-session
-   cooldown has elapsed. The pass opens by asking whether anything is durable at
-   all; "nothing durable" is a normal answer and costs one turn.
+6. Trigger a compaction. A forked `refine` row appears **only if the session has
+   taken 15 model steps since the last pass** (manual or automatic). The child
+   reads the completed-turn prefix — the history the compaction is about to
+   replace — and opens by asking whether anything is durable at all; "nothing
+   durable" is a normal answer.
 7. Ask the agent to correct an entry it already recorded. It must **update the
    entry by its ref**, not add a second one beside it — check with
    `/refine --list` that the count did not grow. Two entries that disagree are

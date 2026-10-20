@@ -225,8 +225,9 @@ assert.match(await refine("--nope"), /unknown flag/, "a typo must not become a r
  * session's own preset — otherwise `/compact` in `standard` or `ptc` injected a
  * refinement turn into a mode with no harness and no `harness_refine` tool. */
 {
-	const { presetOf, onCompaction, PRESET_ID } = await import("../index.js");
+	const { presetOf, onCompaction, PRESET_ID, MIN_STEPS } = await import("../index.js");
 	assert.equal(PRESET_ID, "prime");
+	assert.equal(MIN_STEPS, 15, "the automatic floor counts model steps");
 
 	/* The projection the registry actually writes, used as the fixture so the key
 	 * cannot drift from the package that owns it. */
@@ -274,70 +275,134 @@ assert.match(await refine("--nope"), /unknown flag/, "a typo must not become a r
 	assert.equal(presetOf(withPresets("ptc", atPreset("prime")), null, { id: "s" }), "prime");
 
 	const followups = [];
-	/* One agent per session, keyed by id, so the per-session cooldown is exercised
-	 * rather than one agent standing in for all of them. */
+	const forks = [];
+	/* The fork is the only path. A ctx without this service must skip, never
+	 * degrade to an in-turn followup — the followup would read the post-compaction
+	 * history, which is the exact loss the hook exists to avoid. */
+	const forkProvider = {
+		getProvider: (name) => (name === "fork" ? {} : null),
+		startActivation: (request) => {
+			forks.push(request);
+			return { result: Promise.resolve({ stopReason: "ok" }), dispose: () => {} };
+		},
+	};
+	/* One agent per session, keyed by id: the step budget is per session, so one
+	 * session compacting must not spend another session's floor. */
 	const liveAgents = new Map();
 	for (const sid of ["s1", "s2", "s3"]) {
 		liveAgents.set(sid, { session: { id: sid }, followup: (m) => void followups.push({ sid, m }) });
 	}
-	const liveCtx = (preset, sid = "s1") => ({
+	const liveCtx = (preset, sid = "s1", subagents = forkProvider) => ({
 		logger: { warn: (m) => void warns.push(m) },
 		sessionProjections: atPreset(preset),
-		get: (id) => (id === "agents" ? { get: (want) => liveAgents.get(want) } : undefined),
+		get: (id) => (id === "agents" ? { get: (want) => liveAgents.get(want) } : id === "subagents" ? subagents : undefined),
 	});
+	const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+	const sessionEvent = registered.events.filter((e) => e.type === "session/event").pop().handler;
+	const steps = (sid, n = 1, session = { id: sid }) => {
+		for (let i = 0; i < n; i += 1) sessionEvent(session, { type: "step/end" });
+	};
+	const forkedFor = (sid) => forks.filter((f) => f.request.parent.session.id === sid);
 
-	/* The exact bug: `/compact` in a PTC session must not queue a refinement. */
+	/* The exact bug: `/compact` in a PTC session must not fork a pass, however
+	 * much the session has done. */
+	steps("s1", MIN_STEPS);
 	onCompaction(liveCtx("ptc"), { id: "s1" });
-	assert.equal(followups.length, 0, "a ptc session must not be refined");
+	await flush();
+	assert.equal(forks.length, 0, "a ptc session must not be refined");
 	assert.deepEqual(warns, [], "another preset is not a warning");
 	onCompaction(liveCtx("standard"), { id: "s1" });
-	assert.equal(followups.length, 0, "a standard session must not be refined");
+	await flush();
+	assert.equal(forks.length, 0, "a standard session must not be refined");
 
-	/* Settled operator turns, which is what opens the review gate. A `turn/end`
-	 * reaching the handler is a turn the operator's activity produced. */
-	const sessionEvent = registered.events.filter((e) => e.type === "session/event").pop().handler;
-	const settle = (sid) => sessionEvent({ id: sid }, { type: "turn/end" });
+	/* The floor. A compaction below it would re-read the conversation the last
+	 * pass just read, so it waits. */
+	steps("s3", MIN_STEPS - 1);
+	onCompaction(liveCtx("prime", "s3"), { id: "s3" });
+	await flush();
+	assert.equal(forkedFor("s3").length, 0, "below the floor no pass runs");
+	steps("s3");
+	onCompaction(liveCtx("prime", "s3"), { id: "s3" });
+	await flush();
+	assert.equal(forkedFor("s3").length, 1, "the floor opens at MIN_STEPS");
 
-	/* The review gate: a pass earns a whole turn only when the operator has said
-	 * something since the last one. A fresh session proves it — nothing has set
-	 * this session's cooldown yet, so the gate is the only thing that can refuse. */
-	onCompaction(liveCtx("prime", "s3"), { id: "s3" });
-	assert.equal(followups.length, 0, "nothing new since the last pass means no pass");
-	settle("s3");
-	onCompaction(liveCtx("prime", "s3"), { id: "s3" });
-	assert.equal(followups.length, 1, "a settled operator turn opens the gate");
-	assert.equal(followups[0].sid, "s3");
-	assert.match(followups[0].m.content[0].text, /^\[prime auto-refine\] Context was compacted\./);
-	assert.match(followups[0].m.content[0].text, /harness_refine/);
-	assert.match(followups[0].m.content[0].text, /Decide first whether/, "the pass reviews before it records");
+	/* The fork is the pre-compaction read: seeded from the parent, delivered to
+	 * the caller, and told why it is running. */
+	const first = forkedFor("s3")[0];
+	assert.equal(first.provider, "fork");
+	assert.equal(first.delivery, "caller");
+	assert.equal(first.request.parent.session.id, "s3");
+	assert.match(first.request.prompt[0].text, /^\[prime auto-refine\] The conversation is about to be compacted\./);
+	assert.match(first.request.prompt[0].text, /harness_refine/);
+	assert.match(first.request.prompt[0].text, /Decide first whether/, "the pass reviews before it records");
 
-	/* The 20-minute window is per session: one session compacting must not spend
-	 * another session's cooldown, and must not re-arm its own. */
+	/* The fork spends the budget, not the turn ending: a pass resets the floor. */
+	steps("s3", MIN_STEPS - 1);
 	onCompaction(liveCtx("prime", "s3"), { id: "s3" });
-	assert.equal(followups.length, 1, "a second compaction inside the window is not re-queued");
-	settle("s2");
+	await flush();
+	assert.equal(forkedFor("s3").length, 1, "the pass resets the floor");
+	steps("s3");
+	onCompaction(liveCtx("prime", "s3"), { id: "s3" });
+	await flush();
+	assert.equal(forkedFor("s3").length, 2, "a second budget earns a second pass");
+
+	/* A child's steps project under its parent's key, so counting them would let
+	 * one pass pay for the next one it is supposed to gate. */
+	steps("s2", MIN_STEPS - 1);
+	steps("s2", 20, { id: "s2", header: { parentSession: "s2" } });
 	onCompaction(liveCtx("prime", "s2"), { id: "s2" });
-	assert.equal(followups.length, 2, "the cooldown is per session, not per process");
-	assert.equal(followups[1].sid, "s2");
+	await flush();
+	assert.equal(forkedFor("s2").length, 0, "a child's steps do not count for its parent");
 
 	/* An unresolvable preset means auto-refine is dead everywhere, so it says so
 	 * rather than failing quietly. */
 	const before = warns.length;
-	const queuedSoFar = followups.length;
-	settle("s1");
-	onCompaction(mkCtx(null), { id: "s1" });
-	assert.equal(followups.length, queuedSoFar, "no preset means no refinement");
+	onCompaction(mkCtx(null), { id: "s2" });
+	await flush();
+	assert.equal(forkedFor("s2").length, 0, "no preset means no refinement");
 	assert.equal(warns.length, before + 1, "an unresolvable preset is reported");
 	assert.match(warns[before], /could not be resolved/);
 
-	/* A manual `/refine` is not gated: the operator asking IS the reason, and a
-	 * session with no settled turns proves the gate is not what let it through. */
-	const manual = { session: { id: "manual-1" }, followup: (m) => void followups.push({ sid: "manual-1", m }) };
+	/* A profile without the fork provider skips. It must never degrade into a
+	 * followup: that would read the post-compaction history, which is the loss the
+	 * hook exists to prevent. */
+	const noFork = warns.length;
+	onCompaction(liveCtx("prime", "s2", null), { id: "s2" });
+	await flush();
+	assert.equal(forkedFor("s2").length, 0, "no fork provider means no pass");
+	assert.equal(followups.length, 0, "and never a post-compaction followup");
+	assert.match(warns[noFork], /fork/);
+
+	/* A manual `/refine` resets the floor: the operator already spent the read,
+	 * and a pass two steps later would review the same conversation. */
+	const manual = liveAgents.get("s2");
 	const manualPass = refine("", manual);
-	assert.equal(followups.filter((f) => f.sid === "manual-1").length, 1, "a manual pass skips the review gate");
-	/* Close its turn so the awaited row settles; the session never reports here. */
-	registered.events.find((e) => e.type === "session/event").handler({ id: "manual-1" }, { type: "turn/end", data: { turn: 1 } });
+	sessionEvent({ id: "s2" }, { type: "turn/end", data: { turn: 1 } });
 	assert.match(await manualPass, /^refining the session harness/);
+	steps("s2", MIN_STEPS - 1);
+	onCompaction(liveCtx("prime", "s2"), { id: "s2" });
+	await flush();
+	assert.equal(forkedFor("s2").length, 0, "a manual pass resets the step floor");
+	steps("s2");
+	onCompaction(liveCtx("prime", "s2"), { id: "s2" });
+	await flush();
+	assert.equal(forkedFor("s2").length, 1, "and the floor still opens afterwards");
+
+	/* The wiring is `compaction/start`, not `end`: `start` lands before the
+	 * summarization call, so the surface still holds the conversation the pass is
+	 * meant to read. `end` fires after the replacement and must not fork. */
+	services.agents = { get: (want) => liveAgents.get(want) };
+	services.subagents = forkProvider;
+	ctx.sessionProjections = atPreset("prime");
+	sessionEvent({ id: "s1" }, { type: "compaction/start", data: { compactionId: "c1" } });
+	await flush();
+	assert.equal(forkedFor("s1").length, 1, "compaction/start forks the pass");
+	sessionEvent({ id: "s1" }, { type: "compaction/end", data: { compactionId: "c1" } });
+	await flush();
+	assert.equal(forkedFor("s1").length, 1, "compaction/end does not fork a second");
+	delete services.agents;
+	delete services.subagents;
+	delete ctx.sessionProjections;
 }
 assert.equal(registered.commands[0].handler({ rawInput: "", agent }).kind, "error", "no live agent is a reported error, not a string");
 assert.equal(section.name, "prime:continual-harness");
@@ -389,7 +454,7 @@ assert.match(await refine("--list"), /is empty/);
  * things the fork exists for: it opens no turn, and it does not claim to have
  * refined when the store is unchanged. */
 {
-	const { apply: applyFork, save: saveForkScoped, loadSnapshots: snapsFork } = await import("../index.js?fork-path");
+	const { apply: applyFork, save: saveForkScoped, loadSnapshots: snapsFork, upsert: upsertFork, recordPassSnapshot: recordFork } = await import("../index.js?fork-path");
 	const calls = [];
 	const forkEvents = [];
 	let mode = "records"; // "records" | "silent"
@@ -435,6 +500,14 @@ assert.match(await refine("--list"), /is empty/);
 	assert.equal(snapsFork("session", forked).length, 1);
 	const recordedOutcome = await cmd.handler({ rawInput: "", agent: forked });
 	assert.match(recordedOutcome.text, /found nothing durable/, "a second pass with no new writes is still honest");
+
+	/* A pass's snapshot names the child that wrote it: that is the whole data
+	 * path behind the pill's "+1 ~0 -0", so it is asserted, not assumed. */
+	saveForkScoped("session", forked, []);
+	upsertFork("session", forked, "a fact written by a pass", "test", "asserted here");
+	const tagged = recordFork("session", forked, [], "tool:harness_refine (+1 ~0 -0)");
+	assert.equal(tagged.child, "fork-live", "the recording agent's session travels with its snapshot");
+	assert.deepEqual(tagged.diff, { added: 1, updated: 0, deleted: 0 });
 
 	/* Flag queries must never spawn a child. */
 	const spawnedBefore = calls.length;
@@ -573,7 +646,8 @@ assert.ok(!/"count\.total\.other": "\{count\} subagents"/.test(client), "the cou
 	const render = (catalog) => text(React.createElement(pill.component, {
 		sessionId: "s1",
 		t: (key) => key,
-		useSessions: (select) => select({ projectionsBySession: { s1: { values: { subagentCatalog: catalog } } } })
+		useSessions: (select) => select({ projectionsBySession: { s1: { values: { subagentCatalog: catalog } } } }),
+		useSessionStatus: (select) => select(new Map())
 	}));
 	/* The count itself is the shipped component's (the fake hardcodes 4); only the words are ours. */
 	assert.equal(render([{ label: "refine 21:04" }, { label: "refine 21:11" }]), "4 refines", "passes read as refines");
