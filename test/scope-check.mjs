@@ -171,15 +171,19 @@ assert.equal(m.render([], a).includes("harness_refine"), true, "and still render
 	assert.equal(m.load("session", a).length, 2);
 	assert.ok(m.loadSnapshots("session", a).length >= 2, "each mutation records a before/after snapshot");
 	assert.match(m.refine("session --snapshots", a).text, /snapshots \(session\):/);
-	assert.match(m.refine("session --diff", a).text, /\+ [0-9a-f]{8} second durable fact/);
 
-	const rb = m.refine("session --rollback", a);
-	assert.equal(rb.kind, "success");
+	// Diff and rollback are Settings/RPC operations, not slash flags: a snapshot
+	// needs a ref, and a slash command cannot carry one. The functions below are
+	// the same ones `/prime/api` calls.
+	assert.match(m.diffSnapshot("session", a).text, /\+ [0-9a-f]{8} second durable fact/);
+
+	const rb = m.rollbackSnapshot("session", a);
+	assert.equal(rb.ok, true);
 	assert.equal(m.load("session", a).length, 1);
 	assert.equal(m.load("session", a)[0].text, "first durable fact");
 
-	const rbUndo = m.refine("session --rollback", a);
-	assert.equal(rbUndo.kind, "success");
+	const rbUndo = m.rollbackSnapshot("session", a);
+	assert.equal(rbUndo.ok, true);
 	assert.equal(m.load("session", a).length, 2);
 
 	const ref0 = m.entryRef(m.load("session", a)[0]);

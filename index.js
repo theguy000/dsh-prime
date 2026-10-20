@@ -952,14 +952,6 @@ export function refine(rawInput, agent) {
       return "- " + entryRef(s) + (d ? " [" + d + "]" : "") + " " + (s.reason || "update") + " (" + s.beforeCount + " -> " + s.afterCount + "; +" + df.added + " ~" + df.updated + " -" + df.deleted + ")";
     }).join("\n"));
   }
-  if (body === "--rollback" || body.startsWith("--rollback ") || body === "--undo" || body.startsWith("--undo ")) {
-    const res = rollbackSnapshot(scope, agent, body.replace(/^--(rollback|undo)\b/, "").trim());
-    return res.ok ? ok("rolled back " + res.scope + " harness to snapshot " + res.ref + " (" + res.previousCount + " -> " + res.restoredCount + " entries)") : err("refine: " + res.error);
-  }
-  if (body === "--diff" || body.startsWith("--diff ")) {
-    const res = diffSnapshot(scope, agent, body.replace(/^--diff\b/, "").trim());
-    return res.ok ? ok(res.text) : err("refine: " + res.error);
-  }
   if (body.startsWith("--pin ") || body.startsWith("--unpin ")) {
     const isPin = body.startsWith("--pin ");
     const targetRef = body.replace(/^--(un)?pin\b/, "").trim();
@@ -1863,7 +1855,7 @@ export function apply(ctx, config) {
       const agent = invocation && invocation.agent;
       const rawInput = invocation && invocation.rawInput;
       /* Only a bare `/refine` is a pass, and only a pass can be forked. Flag
-       * queries (`--list`, `--diff`, …) stay synchronous and local, and so does
+       * queries (`--list`, `--snapshots`, …) stay synchronous and local, and so does
        * `/refine global` — it parses to an empty body but is a removed-scope
        * error, not a pass. */
       const parsed = parseRefine(rawInput);

@@ -647,8 +647,6 @@ h("h2", { className: "dp-h" }, "Prime Harness"),
 h("p", { className: "dp-sub" },
 "Scoped continual memory (",
 h("code", null, "/refine"),
-", ",
-h("code", null, "/refine --rollback"),
 ") that survives compaction and re-injects verified facts, prompt rules, skills, and subagent roles."
 )
 ),

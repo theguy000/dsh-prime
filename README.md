@@ -1,36 +1,47 @@
+<div align="center">
+
 # dsh-prime
 
-A `prime` agent mode for DeepSeek Harness ? an **RLM-style** mode in the sense
-[prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) uses the term ? plus the
-piece DSH does not ship out of the box: the **Continual Harness** and a
-**persistent per-session Python RLM REPL**.
+**prime-agent, as a first-class DeepSeek Harness mode.**
 
-**Programmatic tool calling & persistent Python REPL.** The model works through
-code by default (`python_repl` + `mode: native`) and has a stateful `python_repl` tool backed by a
-persistent per-session Python 3 process. Context lives in variables (`ctx`,
-`messages`, `goal`, `workspace`, `store`), top-level `await` is enabled, and
-subagents, harness state, and host tools are callable directly from Python
-(`await rlm("...")`, `rlm.spawn()`, `rlm.harness.*`, `await tools.<name>(**kwargs)`).
+Programmatic tool calls · a persistent Python REPL · a continual harness that
+outlives compaction.
 
-**The Continual Harness.** Durable, scoped, versioned memory the agent maintains
-itself and that outlives compaction. Facts, prompt rules, reusable skills, and
-subagent role specs are recorded with the evidence that prompted them; every
-entry carries an 8-character `ref` the agent (or operator) can use to update,
-pin, or delete it in place; every write snapshots `before`/`after` state for
-instant `--rollback`; and both layers (`session` and `workspace`) are
-re-injected into every Prime prompt.
+[![DeepSeek Harness](https://img.shields.io/badge/deepseek_harness-0.1.5_--_0.3-4D6BFE)](https://github.com/deepseek-ai)
+[![Node](https://img.shields.io/badge/node-%E2%89%A5_20-339933)](https://nodejs.org)
+[![version](https://img.shields.io/badge/version-1.2.0-black)](package.json)
+[![checks](https://img.shields.io/badge/checks-passing-2ea44f)](VERIFY.md)
 
-### How far the RLM comparison goes
+</div>
 
-| prime-agent | dsh-prime |
-|---|---|
-| Programmatic tool and subagent calls from code | **Same** ? `await tools.<name>(args)` in Node PTC + `await tools.<name>(**kwargs)` in `python_repl` |
-| Persistent REPL: context lives in variables across calls | **Full** ? `python_repl` keeps a persistent Python 3 kernel per session with `ctx` (including pre-compaction turns), `messages`, `goal`, `workspace`, and disk-backed `store` |
-| `rlm.spawn()` handles, replies over `agent_message` | **Full** ? `rlm.spawn()` / `await rlm(..., role=...)`, `rlm.list_subagents()`, `rlm.send_message()`, `rlm.interrupt()`, and `agent_message.send()` |
-| Continual Harness: scoped, refined, versioned state | **Full** ? two scopes (`session`, `workspace`), 4 component kinds (`memory`, `prompt`, `skill`, `subagent`), `add`/`update`/`delete`/`pin` by 8-char `ref`, evidence gate, and before/after snapshots with `--diff` and `--rollback` |
+> Standing on **[prime-agent](https://github.com/PrimeIntellect-ai/prime-agent)**
+> by Prime Intellect — the project this mode reproduces, and the source of every
+> idea below. Read the original first; the credits are at the bottom.
 
-Select **Prime** in Web/Desktop from the agent-preset picker, or make it the
-default by patching the profile:
+`dsh-prime` adds a **`prime`** agent preset to DeepSeek Harness. DeepSeek Harness
+already ships nearly every surface prime-agent has; `cordis.patch.yml` wires those
+packages into one self-contained mode, and the new code supplies the two pieces
+DSH has no equivalent for: **a persistent per-session Python RLM REPL** and **the
+Continual Harness** — durable, scoped memory the agent maintains itself, with
+snapshots and rollback.
+
+## What you get
+
+| Feature | What it means |
+|:--|:--|
+| **Programmatic by default** | The model's primary tool is a REPL, not a one-shot function call. It writes code that calls tools and agents: `await tools.<name>(**kwargs)`, `await rlm("…")`. |
+| **A persistent Python 3 kernel** | Variables, imports, functions, and `store` survive across turns and restarts. `ctx` and `messages` still contain compacted turns the prompt no longer carries. |
+| **A continual harness** | Durable memory with an evidence gate, 8-character `ref` handles, in-place correction, and `before`/`after` snapshots you can roll back. Re-injected into every Prime prompt. |
+
+## Install
+
+```sh
+dsh plugin --profile desktop add github:theguy000/dsh-prime
+```
+
+`desktop` is the app's profile — use `web` for `dsh web`, or whatever you named
+your own. Restart, then pick **Prime** in the Web/Desktop agent-preset picker.
+To make it the default, patch the same profile:
 
 ```yaml
 - id: agent-preset-registry
@@ -38,43 +49,85 @@ default by patching the profile:
     default: prime
 ```
 
-## Design
-
-**Parity is composition plus a focused RLM & Continual Harness runtime.** DSH
-already ships most prime-agent surfaces; `cordis.patch.yml` is a declarative
-`@deepseek-ai/dsh-agent-preset` declaration that wires those shipped packages
-together, while `index.js`, `tool.js`, and `client.js` provide the Continual
-Harness, the persistent Python REPL bridge, dynamic skill/subagent projection,
-and the Settings ? **Prime Harness** management UI.
-
 A preset's `config.plugins` list is never merged with another preset's, so the
-mode is self-contained and cannot be perturbed by edits to `standard` or `ptc`.
+mode is self-contained — editing `standard` or `ptc` cannot perturb it.
 
-## Parity matrix
+## The Continual Harness
 
-Source of truth for the left column: [prime-agent README](https://github.com/PrimeIntellect-ai/prime-agent#readme).
+`/refine` is the command; `harness_refine` is the tool the agent actually writes
+through (a slash command is operator-only). Entries live on disk, so they outlive
+compaction by construction, and the prompt section is re-rendered on every
+assembly.
 
-| prime-agent capability | DSH realization | Status |
-|---|---|---|
-| "Everything is programmatic" ? model tool is a persistent REPL | `dsh-agent-tool-presentation` with `mode: ptc`, `dsh-tool-workflow` over `dsh-workflow-ptc`, a persistent shell (`dsh-tool-bash-persistent` / `dsh-tool-pwsh-persistent`), **plus** `python_repl` (stateful per-session Python 3 RLM kernel with `ctx`, `messages`, `store`, `rlm.*`, and `tools.*`) | **Full** |
-| `rlm.spawn(...)` subagents returning results programmatically | `dsh-tool-subagent` (`provider: spawn`) + `dsh-tool-subagent-fork` (`provider: fork`) + `python_repl`'s `rlm.spawn(..., role=...)` / `rlm.send_message` / `agent_message.send` | **Full** |
-| `/refine` ? harness improves itself, base prompt immutable, snapshots roll back | **`dsh-prime`** (this plugin): durable store + `/refine` command + `harness_refine` tool + 4 component kinds + in-place update/delete/pin by `ref` + before/after snapshots with `--rollback` and `--diff` + post-compaction auto-refine | **Full** |
-| Skills are executable packages; skill creator | `dsh-skill-filesystem` + `dsh-tool-skill` + dynamic `prime-harness` skill provider exposing `kind: "skill"` harness entries to the live skill catalog | **Full** |
-| Sessions run in the background; reattach later | `dsh-jobs-local` + `dsh-tool-jobs` + session persistence; children outlive their parent turn | **Partial** ? no detach/reattach outside the app |
-| Agents communicate directly | `rlm.send_message` / `agent_message.send` in `python_repl` + `dsh-tool-subagent-control`; `dsh-experimental-agent-team` available if peer-roster UX is preferred | **Full** (via RLM/subagent messaging; see Note 1) |
-| Automatic compaction | `compaction` group: `dsh-compaction-basic`, `dsh-command-compact`, `dsh-compaction-tool-result-pruner` | **Full** |
-| Persistent goals (`/goal`) | `dsh-command-goal` + `dsh-tool-goal` over `dsh-goal` | **Full** |
-| Bounded autonomous mode (`/autonomous`) with budgets | `dsh-goal-round-driver` + `maxGoalRounds` cap + `dsh-tool-ralph` fresh-agent loop | **Partial** ? no user-defined quality gates (see Note 2) |
-| Heartbeats and schedules (`/heartbeat`, `prime-agent schedule`) | `dsh-time-context` + `dsh-tool-schedule` over `dsh-schedule` | **Full** |
-| Long tasks keep moving across turns | goals + compaction + retained/continuable subagents + schedule + persistent REPL `store` | **Full** |
-| Clipboard over SSH/tmux, custom certificate authorities | Not mode concerns; DSH handles these at the deployment/transport layer | N/A |
+```text
+operator types /refine
+  └─▶ a forked pass re-reads the conversation
+        └─▶ harness_refine(findings: [...])
+              └─▶ ~/.dsh/prime/*.json  (snapshot recorded)
+                    └─▶ the "Established:" section of every Prime prompt
+```
 
-## The continual harness
+### Using `/refine`
 
-`/refine` with no argument runs a **refinement pass**: the agent reviews the
-conversation and records what should outlive it. `/refine <note>` records a
-note directly. Entries live on disk, so they outlive compaction by
-construction, and the prompt section is re-rendered on every assembly.
+| Command | What it does |
+|:--|:--|
+| `/refine` | Run a **refinement pass**: review the conversation and record what should outlive it |
+| `/refine workspace` | Same pass, writing to the workspace scope |
+| `/refine <note>` | Record a note directly |
+| `/refine workspace --kind prompt always run checks before committing` | Record a standing rule |
+| `/refine workspace --kind skill --name lint-check Run npm run check before commit.` | Register a reusable skill |
+| `/refine --list` | Show the entries both layers render |
+| `/refine --snapshots` | List snapshots |
+| `/refine --pin <ref>` / `--unpin <ref>` | Pin or unpin an entry |
+| `/refine --edit <ref> <new text>` | Update an entry in place |
+| `/refine --delete <ref>` | Delete an entry |
+| `/refine --clear` | Empty the selected scope |
+| `/refine --reset-repl` | Reset the session's persistent Python REPL |
+| `/refine --help` | Print the usage line |
+
+Flag queries (`--list`, `--snapshots`, …) never start an agent at all.
+
+### Four component kinds
+
+Every rendered line starts with its `ref`, creation date, and optional kind tag:
+
+```text
+- 31725ce5 [2026-10-17] [prompt:routing] Always declare Route: fast-path before routine edits.
+```
+
+When an entry is wrong or superseded, the model updates or deletes it **by `ref`**
+instead of appending a contradictory entry beside it.
+
+| Kind | Holds | Effect |
+|:--|:--|:--|
+| `memory` (default) | durable facts, constraints, findings | injected into the prompt section |
+| `prompt` | standing behavioral or routing rules | injected **first**, ahead of unpinned memory, so routine facts never evict them |
+| `skill` | reusable workflows | registered into DSH's live `skills` service by the `prime-harness` provider, callable immediately by `tool-skill` and `/` triggers |
+| `subagent` | role specifications | prepended automatically to `rlm.spawn(..., role="<name\|ref>")` tasks |
+
+### Two scopes, and only the operator picks
+
+The write target is chosen in **Settings → Prime Harness**. The agent never
+chooses: everything it records goes to the selected layer. It always *reads*
+both.
+
+| Scope | Reach | Stored as |
+|:--|:--|:--|
+| `session` (default) | this conversation only | `~/.dsh/prime/session-<id>.json` |
+| `workspace` | every session sharing this working directory | `~/.dsh/prime/project-<sha1(cwd)>.json` |
+
+### Snapshots and the evidence gate
+
+`harness_refine` takes `findings: [...]` — up to 20 edits per call, and an
+oversized batch is rejected **atomically**, so a pass is never half-written. An
+edit with no evidence is refused.
+
+Every mutation records a bounded `before`/`after` snapshot (`MAX_SNAPSHOTS = 25`)
+with `+added ~updated -deleted` counts. **Settings → Prime Harness** lists them,
+renders the diff inline, and rolls any pass back with one click.
+
+<details>
+<summary><b>How a <code>/refine</code> pass actually runs</b></summary>
 
 **A pass behaves like a built-in command.** A bare `/refine` runs the pass as a
 **forked subagent** with `delivery: "caller"`: the child is seeded with this
@@ -96,194 +149,175 @@ The row looks and shimmers exactly like the built-in one; only the words differ.
 **Each pass is its own row in the subagent list.** `startActivation` catalogs the
 child unconditionally — `delivery: "caller"` suppresses the settlement *message*,
 not the catalog entry — so passes are already visible there. The label carries
-the time, making that list a pass history:
+the time, making that list a pass history.
 
 **The row reports what actually happened, not that the child returned.** A child
 that ends normally without recording anything is a success by `stopReason` and a
 lie by outcome, so the handler compares the store's snapshot count before and
-after the child runs and says either `refined … (N pass snapshots recorded)` or
+after the child runs and reports either `refined … (N pass snapshots recorded)` or
 `the pass found nothing durable to record`. Nothing durable is a legitimate
 answer; claiming a refinement that did not occur is not.
 
-The child's `harness_refine` writes land in the **parent's** store, not the
-child's: a delegated child's session header records `parentSession`, and
-`storeSessionId` follows it back. Without that, every finding landed in a file
-nobody reads — a silent loss, because the write itself succeeds.
+**The child's writes land in the parent's store.** A delegated child's session
+header records `parentSession`, and `storeSessionId` follows it back. Without
+that, every finding landed in a file nobody reads — a silent loss, because the
+write itself succeeds.
 
-Two paths stay in-process. Flag queries (`--list`, `--diff`, `--snapshots`, …)
-never start an agent at all. The post-compaction hook keeps its own in-turn
-pass, because a fork's seed stops at the last `turn/end` and that hook fires
-immediately after a compaction replaces the surface. That in-turn pass carries
-`source: { kind: "prime-refine" }`, not `user`, so Chat draws the collapsed
-turn-trigger notice rather than an operator bubble, and `isSpeaker` stops reading
-the pass's boilerplate as the operator's own words. It is also bound to the exact
-turn it opens, so an operator turn settling while it is still queued cannot
-settle the row early.
+**Two paths stay in-process.** Flag queries never start an agent. The
+post-compaction hook keeps its own in-turn pass, because a fork's seed stops at
+the last `turn/end` and that hook fires immediately after a compaction replaces
+the surface. It carries `source: { kind: "prime-refine" }`, not `user`, so Chat
+draws the collapsed turn-trigger notice rather than an operator bubble and
+`isSpeaker` stops reading its boilerplate as the operator's own words. It is
+bound to the exact turn it opens, so an operator turn settling while it is queued
+cannot settle the row early.
 
-The agent writes through the `harness_refine` tool (or `rlm.harness.*` inside
-`python_repl`), never the slash command ? a slash command is operator-only, so
-the triggers below all name the tool.
-
-**The section asserts its own authority, and it has to.** The section opens
-with *"Treat them as already verified: when one answers the operator's question,
-answer from it rather than re-deriving the answer from the code"*, and says to
-read source only when nothing covers the question or the fact may have gone
-stale. The heading is `Established:`, because `Recorded:` reads as a log.
+**The section asserts its own authority.** It opens with *"Treat them as already
+verified: when one answers the operator's question, answer from it rather than
+re-deriving the answer from the code"*, and says to read source only when nothing
+covers the question or the fact may have gone stale. The heading is
+`Established:`, because `Recorded:` reads as a log.
 
 **Capture is eager, not a rescue.** The prompt section carries a standing
-instruction to record a durable fact in the same turn the operator states it,
-because a preference that only lives in the conversation is gone once the
-history is condensed. The manual `/refine` command and post-compaction hook are
-backstops for what the eager path missed.
+instruction to record a durable fact in the same turn the operator states it. A
+preference that only lives in the conversation is gone once the history is
+condensed; the manual command and the post-compaction hook are backstops.
 
-**In-place correction by `ref`, 4 component kinds, and snapshots.** Every rendered
-line starts with its 8-character `ref` handle, creation date, and optional
-`[kind:name]` tag:
+</details>
 
-```text
-- 31725ce5 [2026-10-17] [prompt:routing] Always declare Route: fast-path before routine edits.
-```
-
-When an entry is wrong or superseded, the model updates or deletes it by `ref`
-(`action: "update" | "delete"`) instead of appending a contradictory entry
-beside it. Every entry has one of four component kinds:
-
-- `memory` (default) ? durable facts, constraints, and findings.
-- `prompt` ? standing behavioral or routing rules obeyed on every turn and
-  prioritized ahead of unpinned `memory` notes so routine facts never evict them.
-- `skill` ? reusable workflows dynamically registered into DSH's live `skills`
-  service (`prime-harness` provider) so `tool-skill` and `/` triggers can invoke
-  them immediately.
-- `subagent` ? reusable subagent role specifications that `rlm.spawn(..., role="<name|ref>")`
-  automatically prepends to the spawned subagent's task prompt.
-
-**One call carries the whole pass, and every pass is snapshotted.** `harness_refine`
-takes `findings: [...]` (up to 20 edits per call; an oversized batch is rejected
-atomically so a pass is never half-written). Every mutation records a bounded
-`before`/`after` snapshot (`MAX_SNAPSHOTS = 25`) with `+added ~updated -deleted`
-diff counts, so any pass or edit can be inspected with `/refine --diff [<ref>]`
-and undone in one step with `/refine --rollback [<ref>]`.
-
-### Scopes & CLI usage
-
-Two layers. The operator selects the write target in Settings ? **Prime Harness**,
-and **the agent never chooses**: everything it records goes to the selected
-layer. It always *reads* both.
-
-| Scope | Reach | Stored as |
-|---|---|---|
-| `session` (default) | this conversation only | `~/.dsh/prime/session-<id>.json` |
-| `workspace` | every session sharing this working directory | `~/.dsh/prime/project-<sha1(cwd)>.json` |
-
-```text
-/refine                                            # refinement pass, default scope
-/refine workspace                                  # refinement pass, workspace scope
-/refine prefer composition over a new abstraction
-/refine workspace --kind prompt always run checks before committing
-/refine workspace --kind skill --name lint-check Run npm run check before git commit.
-/refine --list
-/refine --clear
-/refine --snapshots                                # list before/after snapshots
-/refine --rollback [<ref>]                         # roll back to the latest or named snapshot
-/refine --diff [<ref>]                             # inspect before/after diff of a pass
-/refine --pin <ref> / --unpin <ref>                # pin or unpin an entry by ref
-/refine --edit <ref> <new text>                    # update an entry in place by ref
-/refine --delete <ref>                             # delete an entry by ref
-/refine --reset-repl                               # reset the session's persistent Python REPL
-```
-
-### Ranking & prompt-cache stability
+<details>
+<summary><b>Ranking, and why prompt order is stable</b></summary>
 
 Relevance ranking mirrors prime-agent's `harness_digest.rs`: the goal objective
 is weighted `3.0`, then the last four user/assistant speaker messages
-(`source.kind` filtered before windowing so injected runtime context cannot
+(`source.kind` filtered before windowing, so injected runtime context cannot
 crowd out the operator's words) are weighted `2.0 / 1.5 / 1.0 / 1.0`, up to 48
 query terms, with `pinned` entries boosted by `+100`.
 
 In the system prompt, entry order is **pinned-first, then `prompt`-kind rules,
 then newest-first** (`promptOrder`) within a `topK = 12` / `4000`-character
-budget rather than query-reordered on every turn, keeping the LLM KV-cache
-prefix stable across steps. `rank` drives `/refine --list` and the Settings UI.
+budget — not query-reordered on every turn, which keeps the LLM KV-cache prefix
+stable across steps. `rank` drives `/refine --list` and the Settings UI.
 
-## Persistent Python REPL (`python_repl`)
+</details>
 
-Alongside DSH's Node PTC runtime (`run_code`), Prime mounts `python_repl`: a
-stateful, per-session Python 3 kernel with top-level `await` and a bidirectional
-JSON-RPC bridge back to the host.
+## The persistent REPL: `python_repl`
 
-- **Persistent namespace & disk store:** Variables, functions, classes, and
-  imports survive across turns within the session. Any JSON-serializable key
-  written to `store["key"] = value` (or passed via `set_vars`) is persisted to
+Alongside DSH's Node-side workflow runtime, Prime mounts a stateful, per-session
+Python 3 kernel with top-level `await` and a bidirectional JSON-RPC bridge back
+to the host.
+
+```python
+facts  = await rlm.harness.list(kind="memory")
+store["memory_count"] = len(facts)           # persisted across restarts
+
+await tools.web_search(queries=["dsh plugin manifest"])
+await rlm("audit the last three commits", name="auditor", role="reviewer")
+```
+
+- **Persistent namespace & disk store:** variables, functions, classes, and
+  imports survive across turns within the session. Any JSON-serializable value
+  written to `store["key"]` (or passed via `set_vars`) persists to
   `~/.dsh/prime/repl-session-<id>.json` across restarts.
-- **Compaction-surviving transcript (`ctx` & `messages`):** Before each evaluation,
-  `extractSessionContext` reads `session.snapshotEvents()` (marking compacted
-  frames with `compacted: true`), so Python code can search and analyze the
-  entire conversation even after context compaction drops older turns from the
-  model prompt.
-- **Programmatic RLM & tool bridge:**
+- **Compaction-surviving transcript (`ctx`, `messages`):** before each
+  evaluation, `extractSessionContext` reads `session.snapshotEvents()` and marks
+  compacted frames with `compacted: true`, so Python can search the entire
+  conversation even after older turns drop out of the model prompt.
+- **Programmatic RLM and tool bridge:**
   - `await rlm("task", name="worker", role="auditor", fork=False)` or `rlm.spawn(...)`
   - `await rlm.list_subagents()`, `await rlm.send_message(id_or_name, msg)`, `await rlm.interrupt(id_or_name)`
   - `await agent_message.send(msg, receiver_name="main")`
   - `await rlm.harness.list(scope=None, kind=None)`, `.add(...)`, `.update(...)`, `.delete(...)`, `.snapshots()`, `.rollback()`, `.diff()`
-  - `await tools.<tool_name>(**kwargs)` ? invokes any registered DSH tool on the calling agent.
-
-## Windows Desktop ConPTY & Sandbox Bridge
-
-In DeepSeek Harness Desktop on Windows, `process.execPath` is `DeepSeek Harness.exe`
-(an Electron binary linked with `/SUBSYSTEM:WINDOWS`), and `@deepseek-ai/dsh-sandbox-windows-acl/lib/runner.js`
-lives inside `resources/app.asar`. While pipe-based subprocesses inherit
-handles normally, `dsh-terminal-bash` (`persistent-pwsh`) spawns its shell via
-`node-pty` (`CreatePseudoConsole` / ConPTY). Windows ConPTY does not attach a
-`WINDOWS_GUI` subsystem executable to a pseudo-console, which otherwise causes
-`persistent-pwsh` under `workspace-write` to exit immediately with
-`Error: PTY shell exited during startup`.
-
-`ensureWindowsSandboxRunner` in `index.js` automatically bridges this on
-Windows Desktop by extracting the sandbox runner and native `koffi` bindings to
-a versioned temp cache and pointing `sandbox.internals.windowsAclRunnerArgs` at
-DSH's bundled `/SUBSYSTEM:CONSOLE` Node binary
-(`resources/runtime/primary-runtime/dependencies/node/bin/node.exe`).
+  - `await tools.<tool_name>(**kwargs)` — invokes any registered DSH tool on the calling agent
 
 ## Settings UI
 
-Settings ? **Prime Harness** (registered by `client.js` using
+**Settings → Prime Harness** (registered by `client.js` with
 `@deepseek-ai/dsh-client-ui-primitives`) talks to `POST /prime/api` and provides:
 
-- **Default Write Scope & Workspaces Browser:** Switch between **This conversation**
-  (`session`) and **Workspaces** (`workspace`). In Workspaces view, a full
-  workspace selector lists every known repository on cold boot (discovered from
-  live sessions, DSH `storages`, and `~/.dsh/prime/project-*.json` files) with
-  entry counts, so you can inspect, add, edit, or roll back any workspace's
-  memory even when no chat is currently open.
-- **Component Kinds & Entry Controls:** Filter and add entries by kind
-  (`Memory`, `Prompt`, `Skill`, `Subagent`), pin/unpin entries to the top of the
-  prompt section, edit entry text/kind/name in place, or delete individual
-  entries.
-- **Snapshot History, Diff & Rollback:** Inspect every recorded pass (`+added ~updated -deleted`),
-  view its before/after diff inline, and roll back with one click.
-- **Persistent Python REPL Status:** View active kernel state, evaluation count,
-  live variable names, persisted `store` keys, and reset the kernel.
+- **Default write scope & workspace browser** — switch between **This
+  conversation** (`session`) and **Workspaces** (`workspace`). The workspace view
+  lists every known repository on cold boot (discovered from live sessions, DSH
+  `storages`, and `~/.dsh/prime/project-*.json`) with entry counts, so you can
+  inspect, add, edit, or roll back memory even with no chat open.
+- **Kinds & entry controls** — filter and add by kind (`Memory`, `Prompt`,
+  `Skill`, `Subagent`), pin/unpin to the top of the prompt section, edit text,
+  kind, or name in place, or delete an entry.
+- **Snapshot history, diff & rollback** — every recorded pass with
+  `+added ~updated -deleted`, inline before/after diff, one-click rollback.
+- **REPL status** — active kernel state, evaluation count, live variable names,
+  persisted `store` keys, and reset.
 
-## Verifying
+## Parity with prime-agent
+
+Source of truth for the left column: the
+[prime-agent README](https://github.com/PrimeIntellect-ai/prime-agent#readme).
+Only `dsh-prime` is new code; the rest is composition of shipped packages.
+
+| prime-agent capability | DSH realization | Status |
+|:--|:--|:--|
+| "Everything is programmatic" — the model tool is a persistent REPL | `dsh-agent-tool-presentation` (`mode: native`), `dsh-tool-workflow` over `dsh-workflow-ptc`, a persistent shell (`dsh-tool-bash-persistent` / `dsh-tool-pwsh-persistent`), **plus** `python_repl` — a stateful per-session Python 3 RLM kernel with `ctx`, `messages`, `store`, `rlm.*`, and `tools.*` | **Full** |
+| `rlm.spawn(...)` subagents returning results programmatically | `dsh-tool-subagent` (`provider: spawn`) + `dsh-tool-subagent-fork` (`provider: fork`) + `python_repl`'s `rlm.spawn(..., role=...)` / `rlm.send_message` / `agent_message.send` | **Full** |
+| `/refine` — harness improves itself, base prompt immutable, snapshots roll back | **`dsh-prime`** (this plugin): durable store + `/refine` command + `harness_refine` tool + 4 component kinds + in-place update/delete/pin by `ref` + before/after snapshots with inline diff and one-click rollback in **Settings → Prime Harness** + post-compaction auto-refine | **Full** |
+| Skills are executable packages; skill creator | `dsh-skill-filesystem` + `dsh-tool-skill` + the dynamic `prime-harness` skill provider exposing `kind: "skill"` entries to the live catalog | **Full** |
+| Sessions run in the background; reattach later | `dsh-jobs-local` + `dsh-tool-jobs` + session persistence; children outlive their parent turn | **Partial** — no detach/reattach outside the app |
+| Agents communicate directly | `rlm.send_message` / `agent_message.send` + `dsh-tool-subagent-control`; `dsh-experimental-agent-team` is available if the peer-roster UX is preferred | **Full** (see note 1) |
+| Automatic compaction | `compaction` group: `dsh-compaction-basic`, `dsh-command-compact`, `dsh-compaction-tool-result-pruner` | **Full** |
+| Persistent goals (`/goal`) | `dsh-command-goal` + `dsh-tool-goal` over `dsh-goal` | **Full** |
+| Bounded autonomous mode (`/autonomous`) with budgets | `dsh-goal-round-driver` + the `maxGoalRounds` cap + `dsh-tool-ralph`'s fresh-agent loop | **Partial** — no user-defined quality gates (see note 2) |
+| Heartbeats and schedules (`/heartbeat`, `prime-agent schedule`) | `dsh-time-context` + `dsh-tool-schedule` over `dsh-schedule` | **Full** |
+| Long tasks keep moving across turns | goals + compaction + retained/continuable subagents + schedule + the REPL's `store` | **Full** |
+
+1. **Agent messaging, not agent teams.** Peers are reached from code
+   (`rlm.send_message`, `agent_message.send`) rather than through a peer-roster
+   UI; the Agent Teams profile is deliberately not mounted because its
+   `list_agents`/`interrupt_agent` rows collide with the delegation group.
+2. **Autonomy is bounded, not gatekept.** Rounds stop at `maxGoalRounds`; there is
+   no separate quality-gate evaluator between rounds.
+
+## Windows: ConPTY and the sandbox bridge
+
+In DSH Desktop on Windows, `process.execPath` is `DeepSeek Harness.exe` — an
+Electron binary linked `/SUBSYSTEM:WINDOWS` — and the sandbox runner lives inside
+`resources/app.asar`. Pipe-based subprocesses inherit handles normally, but
+`dsh-terminal-bash` (`persistent-pwsh`) spawns its shell through `node-pty`
+(`CreatePseudoConsole` / ConPTY), and Windows will not attach a GUI-subsystem
+executable to a pseudo-console. The symptom is `persistent-pwsh` exiting
+immediately under `workspace-write` with `Error: PTY shell exited during startup`.
+
+`ensureWindowsSandboxRunner` in `index.js` bridges this automatically: it extracts
+the sandbox runner and native `koffi` bindings to a versioned temp cache and
+points `sandbox.internals.windowsAclRunnerArgs` at DSH's bundled
+`/SUBSYSTEM:CONSOLE` Node binary
+(`resources/runtime/primary-runtime/dependencies/node/bin/node.exe`).
+
+## Verify
 
 ```sh
 npm run check
 ```
 
+Prints:
+
+```text
+dsh-prime self-check: ok
+dsh-prime patch ok: preset "prime", 40 rows, all resolvable
+ALL PRIME CHECKS PASSED
+```
+
 | Check | Covers |
-|---|---|
-| `test/self-check.mjs` | store round-trip, `/refine` flags, `harness_refine` batch/evidence/update/delete contract, `python_repl` persistent namespace + `store` + RLM subagent/tool/harness RPC bridge + dynamic `skills` provider, preset-gated post-compaction hook, `/prime/api` route end-to-end, and client bundle invariants |
-| `test/validate-patch.mjs` | every row in `cordis.patch.yml` resolves against the installed DSH bundle tree, and both `harness_refine` and `python_repl` schemas pass `@deepseek-ai/dsh-tools`'s validators |
-| `test/scope-check.mjs` | scope isolation (`session` vs `workspace`), retired `project` and `global` spellings, deduplication, capacity cap, and goal/query-weighted ranking |
+|:--|:--|
+| `test/self-check.mjs` | store round-trip, `/refine` flags, the `harness_refine` batch/evidence/update/delete contract, the `python_repl` namespace + `store` + RLM subagent/tool/harness RPC bridge + dynamic `skills` provider, the preset-gated post-compaction hook, `/prime/api` end to end, and client bundle invariants |
+| `test/validate-patch.mjs` | every row in `cordis.patch.yml` resolves against the installed DSH bundle tree; both `harness_refine` and `python_repl` schemas pass `@deepseek-ai/dsh-tools`'s validators |
+| `test/scope-check.mjs` | scope isolation (`session` vs `workspace`), retired `project`/`global` spellings, deduplication, the capacity cap, and goal/query-weighted ranking |
 
-## Layout
+[`VERIFY.md`](VERIFY.md) is the longer, adversarial version: install into a
+throwaway profile, dump the real Loader tree, and assert 40 rows, 3 groups, and
+exactly one `prime` preset declaration.
 
-| File | Role |
-|---|---|
-| `cordis.patch.yml` | Declarative `dsh-prime` root row + self-contained `preset-prime` (`Prime`) agent preset |
-| `index.js` | Continual Harness host half (scoped stores, snapshots/rollback/diff, ranking, `/refine`, preset-gated post-compaction hook, persistent `python_repl` kernel & RPC bridge, Windows ConPTY sandbox bridge, `/prime/api`) |
-| `tool.js` | Agent-scoped half mounted inside `preset-prime`: `prime:continual-harness` prompt section, `harness_refine` tool, `python_repl` tool, and dynamic `prime-harness` skill provider |
-| `client.js` | Settings ? **Prime Harness** UI (`__ModuleLoader__` bundle using `@deepseek-ai/dsh-client-ui-primitives`, no build step) |
-| `test/self-check.mjs` | End-to-end host, tool, `python_repl`, RLM bridge, API route, and client contract tests |
-| `test/validate-patch.mjs` | Bundle row resolution and `@deepseek-ai/dsh-tools` JSON schema validation |
-| `test/scope-check.mjs` | Scope isolation, aliases, deduplication, cap, and relevance ranking tests |
+## Credits
+
+**prime-agent** — [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent)
+by Prime Intellect. Almost nothing here is original invention: this mode exists
+because they published a harness that treats the model's context as a
+programmable runtime.
