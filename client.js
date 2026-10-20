@@ -91,6 +91,7 @@ const CSS = [
 /* The refine row reuses the built-in card's structure, so these mirror
  * GenericCommandCard.module.css rather than inventing a look. */
 ".dp-refine-row{flex-direction:column;display:flex}",
+".dp-pill-broken{font-size:11px;color:var(--dsw-alias-state-error-primary)}",
 ".dp-refine-sep{background:var(--dsw-alias-label-caption);border-radius:1px;flex:none;width:2px;height:2px;margin:0 8px}",
 ".dp-refine-summary{min-width:0;font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(24px + var(--dsh-content-font-delta,0px));text-overflow:ellipsis;white-space:nowrap;flex:auto;overflow:hidden}",
 ".dp-refine-summary[data-error],.dp-refine-body[data-error]{color:var(--dsw-alias-state-error-primary)}",
@@ -750,6 +751,102 @@ children: open ? h("pre", { className: "dp-refine-body", "data-error": state ===
 );
 }
 
+/* ---- The header pill: "N subagents" becomes "N refines" ------------------
+ *
+ * `@deepseek-ai/dsh-client-ui-subagent` owns one cell of the Session header
+ * actions list (`id: "subagent-catalog"`) that counts direct children, and one
+ * single-slot entry in the breadcrumb slot for a child session's own children.
+ * The count text lives in that package's own dictionaries, and
+ * `locale.register` refuses a second dictionary for one namespace, so the words
+ * cannot be patched. The CELL can be replaced: a list slot keeps one entry per
+ * id and elects the lowest priority, so re-registering the shipped id at
+ * `priority: -1` takes it over - the exact shadowing the registry's own
+ * duplicate error suggests.
+ *
+ * The replacement renders the shipped component (read from `slots.entries`,
+ * the registry's documented inspection surface, which keeps shadowed entries),
+ * forwards every prop including the entry's own `inject` face, and swaps only
+ * `t`. So the pill keeps its dropdown, keyboard handling, metrics and
+ * navigation; only four keys change.
+ *
+ * A child is a pass when the host labelled it `refine HH:MM` (`runForkedPass`).
+ * Anything else - an `rlm` worker, a workflow, a standard-mode subagent - keeps
+ * the shipped wording, because "4 subagents" is then the truth. There is no
+ * preset id on the client's session summaries, so the children are the signal.
+ *
+ * If a future ui-subagent renames that cell id the lookup finds nothing and the
+ * pill says so in text, instead of quietly rendering a second pill beside it. */
+const SLOT_ACTIONS = "conversation.session.header.actions";
+const SLOT_LINEAGE = "conversation.session.header.lineage";
+const REFINE_LABEL = /^refine \d/;
+/* ponytail: English only. Translating needs the zh wording DSH never published
+ * for these keys, so a zh page keeps its own "<n> \u4e2a\u5b50\u4ee3\u7406". */
+const REFINE_WORDS = {
+"count.total.one": "{count} refine",
+"count.total.other": "{count} refines",
+"count.running.one": "{count} refine running",
+"count.running.other": "{count} refines running"
+};
+
+function refineWords(t) {
+return (key, params) => {
+const text = REFINE_WORDS[key];
+if (text === undefined) return t(key, params);
+return text.replace("{count}", params === undefined ? "" : String(params.count));
+};
+}
+
+/* True only when every direct child is a pass: an empty catalog is not one. */
+function useOnlyRefines(useSessions, sessionId) {
+return useSessions((state) => {
+const snapshot = state.projectionsBySession[sessionId];
+const catalog = snapshot === undefined ? undefined : snapshot.values.subagentCatalog;
+return catalog !== undefined && catalog.length > 0 && catalog.every((entry) => REFINE_LABEL.test(entry.label || ""));
+});
+}
+
+/* One pass-through replacement for one pill cell.
+ *
+ * Errors are caught HERE, inside our own boundary, and never forwarded: an
+ * ordinary slot entry that throws is ABDICATED, and the cell silently falls
+ * back to the entry it shadowed - indistinguishable from a pill that never
+ * loaded. A boundary turns that into text on the pill. */
+function pillPatch(ctx, slot, sessionOf, targetId) {
+class PillBoundary extends React.Component {
+constructor(props) {
+super(props);
+this.state = { failure: undefined };
+}
+static getDerivedStateFromError(error) {
+return { failure: (error && error.message) || String(error) };
+}
+render() {
+if (this.state.failure !== undefined) return h("span", { className: "dp-pill-broken" }, "prime pill: " + this.state.failure);
+return this.props.children;
+}
+}
+function PillBody(props) {
+const sessionId = sessionOf(props);
+const onlyRefines = useOnlyRefines(props.useSessions, sessionId);
+const words = React.useMemo(() => (onlyRefines ? refineWords(props.t) : props.t), [props.t, onlyRefines]);
+let shipped;
+let broken;
+try {
+shipped = ctx.slots.entries(slot).filter((entry) => entry.component !== PrimePill && (targetId === undefined || entry.options.id === targetId))[0];
+} catch (error) {
+broken = (error && error.message) || String(error);
+}
+if (broken !== undefined) return h("span", { className: "dp-pill-broken" }, "prime pill: " + broken);
+if (shipped === undefined) return h("span", { className: "dp-pill-broken" }, "prime pill: no entry in " + slot);
+const injected = typeof shipped.inject === "function" ? shipped.inject(sessionId) : undefined;
+return h(shipped.component, { ...injected, ...props, t: words });
+}
+function PrimePill(props) {
+return h(PillBoundary, null, h(PillBody, props));
+}
+return PrimePill;
+}
+
 function apply(ctx) {
 ctx.effect(() => {
 ensureCss();
@@ -770,6 +867,19 @@ name: "conversation.chat.commandview",
 id: NS + ":refine",
 key: "refine"
 }, RefineCommandRow));
+
+ctx.slots.inject(SLOT_ACTIONS, () => ctx.slots.register({
+name: SLOT_ACTIONS,
+id: "subagent-catalog",
+order: 10,
+priority: -1,
+locale: "subagent"
+}, pillPatch(ctx, SLOT_ACTIONS, (props) => props.sessionId, "subagent-catalog")));
+ctx.slots.inject(SLOT_LINEAGE, () => ctx.slots.register({
+name: SLOT_LINEAGE,
+priority: -1,
+locale: "subagent"
+}, pillPatch(ctx, SLOT_LINEAGE, (props) => props.lineageSessionId)));
 }
 
 exports.name = name;

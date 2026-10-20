@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import vm from "node:vm";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -510,6 +511,76 @@ assert.ok(!/<select|h\("select"/.test(client), "no restyled native select");
 assert.ok(!/type: "checkbox"/.test(client), "no restyled native checkbox");
 assert.ok(!/^import\s/m.test(client), "the client bundle must be a plain module-loader factory, not an ES module");
 assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not import host packages at runtime");
+/* The header pill must replace the shipped cell rather than sit beside it: a
+ * list slot elects the lowest priority per id, and the count words come from
+ * ui-subagent's own dictionary, which `locale.register` refuses to extend. */
+assert.match(client, /conversation\.session\.header\.actions/);
+assert.match(client, /id: "subagent-catalog"/, "the pill reuses the shipped cell id");
+assert.match(client, /priority: -1/, "a lower priority is what shadows the shipped cell");
+assert.match(client, /slots\.entries\(/, "the replacement forwards to the component it shadowed");
+assert.ok(!/locale\.register\("subagent"/.test(client), "never re-register the shipped subagent dictionary");
+assert.ok(!/"count\.total\.other": "\{count\} subagents"/.test(client), "the count words are not copied");
+/* The pill's wording IS the feature, and a missing key falls back to the shipped
+ * dictionary silently - so render it, against a fake registry, and read the text. */
+{
+	let clientModule;
+	const registrations = [];
+	class Component {
+		constructor(props) { this.props = props; this.state = {}; }
+	}
+	const React = {
+		Component,
+		Fragment: Symbol("Fragment"),
+		createElement: (type, props, ...children) => ({ type, props: { ...(props ?? {}), children: children.length <= 1 ? children[0] : children } }),
+		useMemo: (fn) => fn(),
+		useState: (init) => [typeof init === "function" ? init() : init, () => {}],
+		useCallback: (fn) => fn,
+		useEffect: () => {},
+		useRef: (value) => ({ current: value })
+	};
+	const text = (node) => {
+		if (node === null || node === undefined || typeof node === "boolean") return "";
+		if (typeof node === "string" || typeof node === "number") return String(node);
+		if (Array.isArray(node)) return node.map(text).join("");
+		if (typeof node.type !== "function") return text(node.props.children);
+		if (node.type.prototype !== undefined && typeof node.type.prototype.render === "function") {
+			const instance = new node.type(node.props);
+			instance.props = node.props;
+			if (instance.state === undefined) instance.state = {};
+			return text(instance.render());
+		}
+		return text(node.type(node.props));
+	};
+	const shipped = (props) => React.createElement("span", null, props.t("count.total.other", { count: 4 }));
+	const sandbox = {
+		window: { __ModuleLoader__: { load: ({ factory }) => { clientModule = factory((id) => (id === "react" ? React : {})); } } },
+		document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => {} } },
+		console, queueMicrotask, setTimeout, clearTimeout
+	};
+	vm.createContext(sandbox);
+	vm.runInContext(client, sandbox, { filename: "client.js" });
+	clientModule.apply({
+		effect: (fn) => fn(),
+		slots: {
+			inject: (_key, body) => body(),
+			register: (options, component) => registrations.push({ options, component }),
+			entries: (key) => (key === "conversation.session.header.actions" ? [{ component: shipped, options: { id: "subagent-catalog" }, inject: (id) => ({ child: id }) }] : [])
+		}
+	});
+	const pill = registrations.find((row) => row.options.name === "conversation.session.header.actions");
+	assert.equal(pill.options.id, "subagent-catalog", "the pill must reuse the shipped cell id");
+	assert.equal(pill.options.priority, -1, "only a lower priority shadows the shipped cell");
+	const render = (catalog) => text(React.createElement(pill.component, {
+		sessionId: "s1",
+		t: (key) => key,
+		useSessions: (select) => select({ projectionsBySession: { s1: { values: { subagentCatalog: catalog } } } })
+	}));
+	/* The count itself is the shipped component's (the fake hardcodes 4); only the words are ours. */
+	assert.equal(render([{ label: "refine 21:04" }, { label: "refine 21:11" }]), "4 refines", "passes read as refines");
+	assert.equal(render([{ label: "refine 21:04" }, { label: "auditor" }]), "count.total.other", "a real subagent keeps the shipped words");
+	assert.equal(render([]), "count.total.other", "no children is not a pass list");
+}
+
 
 // The definition is hand-built, so assert the shape `tools.register` validates
 // and that one batch actually writes.

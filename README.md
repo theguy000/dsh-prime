@@ -151,6 +151,8 @@ child unconditionally — `delivery: "caller"` suppresses the settlement *messag
 not the catalog entry — so passes are already visible there. The label carries
 the time, making that list a pass history.
 
+**The header pill says "refines", not "subagents".** The catalog pill in the session header is one cell of `conversation.session.header.actions` (`id: "subagent-catalog"`), and its count text lives in `@deepseek-ai/dsh-client-ui-subagent`'s own dictionary — `locale.register` refuses a second one, so the words cannot be patched. `client.js` re-registers that cell at `priority: -1` instead: a list slot elects the lowest priority per id, so the replacement takes the cell over, renders the shipped component from `slots.entries`, forwards every prop (including its `inject` face) and swaps only `t`. The wording changes only while every direct child carries the host's `refine HH:MM` label; one real subagent among them restores "N subagents".
+
 **The row reports what actually happened, not that the child returned.** A child
 that ends normally without recording anything is a success by `stopReason` and a
 lie by outcome, so the handler compares the store's snapshot count before and
