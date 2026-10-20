@@ -102,14 +102,36 @@ function sessionCwd(agent) {
   } catch { /* header unavailable */ }
   return process.cwd();
 }
+/**
+ * The session whose harness this agent reads and writes.
+ *
+ * Normally the agent's own session. A delegated child is different: it is a
+ * fork of its parent, spawned to run one refinement pass, and its own session id
+ * is a throwaway nobody reads. Resolving to that id made every finding a child
+ * wrote land in a file the parent never opens — a silent loss rather than an
+ * error, because the write itself succeeds.
+ *
+ * The child's session header already records `parentSession` (set by the
+ * subagent runtime when it seeds the child), so this needs no plugin-side
+ * bookkeeping and no model cooperation.
+ * @param agent - live agent, possibly a delegated child.
+ * @returns the durable session id whose store this agent owns.
+ */
+export function storeSessionId(agent) {
+  try {
+    const header = agent && agent.session && agent.session.header;
+    /* Only one level: a pass runs one delegation deep, and following a chain
+     * further would silently attribute a grandchild's writes to its grandparent. */
+    if (header && typeof header.parentSession === "string" && header.parentSession) return header.parentSession;
+    if (agent && agent.session && typeof agent.session.id === "string") return agent.session.id;
+  } catch { /* no session */ }
+  return undefined;
+}
 function scopeKey(scope, agent) {
   if (scope === "workspace") {
     return LEGACY_SCOPE_PREFIX + crypto.createHash("sha1").update(sessionCwd(agent)).digest("hex").slice(0, 16);
   }
-  let id = "default";
-  try {
-    if (agent && agent.session && typeof agent.session.id === "string") id = agent.session.id;
-  } catch { /* no session */ }
+  const id = storeSessionId(agent) || "default";
   return "session-" + id.replace(/[^\w.-]/g, "_").slice(0, 80);
 }
 function scopeFile(scope, agent) {
@@ -713,6 +735,28 @@ const err = (text) => ({ kind: "error", text });
  *  cannot stack duplicate passes. Cleared when the queued turn actually starts. */
 const refining = new Set();
 
+/* Resolvers for in-flight passes, keyed the same way as `refining`.
+ *
+ * A `/refine` invocation awaits its own pass, so the command row stays live —
+ * shimmering — until the turn it started settles, then settles once with the
+ * outcome. Without this the handler returns in the same tick, `command/done`
+ * lands immediately, and the row claims "refining…" while a second, unrelated
+ * turn does the actual work below it.
+ *
+ * Registered for every pass, including the post-compaction hook's: an unawaited
+ * promise costs nothing, and making the registration conditional would put the
+ * "am I awaited?" decision at the call site that is most likely to forget it. */
+const refineWaiters = new Map();
+
+/* The turn number each in-flight pass occupies.
+ *
+ * `refining` says a pass is queued; it does not say the pass's turn has begun.
+ * `/refine` can be invoked while the agent is mid-turn, and `followup` then
+ * parks the message until that turn settles — so releasing on the next
+ * `turn/end` would settle the command row before the pass ran. Only the turn
+ * this pass actually opens may release it. */
+const refineTurns = new Map();
+
 /**
  * The instruction behind both triggers — `/refine` with no note, and the
  * post-compaction hook. Recording goes through `TOOL_NAME` because the agent
@@ -740,6 +784,8 @@ function refinementPrompt(lead) {
 
 /**
  * Queue one refinement turn onto the agent's next turn.
+ * @param agent - live agent whose next turn runs the pass.
+ * @param lead - opening line of the pass instruction.
  * @returns `{ok: true}` once queued, else an `error` for the caller to report.
  */
 function queueRefinement(agent, lead) {
@@ -751,20 +797,129 @@ function queueRefinement(agent, lead) {
    * claiming afterwards leaves the guard set forever and every later `/refine`
    * and every post-compaction pass is refused. */
   refining.add(key);
+  /* Always registered: whether anyone awaits it is the caller's business, and an
+   * unawaited promise costs nothing. Registering only for operator invocations
+   * would mean the hook has to say so, and the hook is the caller that forgets. */
+  let resolveWaiter;
+  refineWaiters.set(key, { promise: new Promise((resolve) => { resolveWaiter = resolve; }), resolve: () => resolveWaiter() });
   try {
     agent.followup({
       id: crypto.randomUUID(),
       role: "user",
       content: [{ type: "text", text: refinementPrompt(lead) }],
-      /* MessageSourceMap is a closed union, so an invented kind throws at the
-       * session boundary; `user` is its only generic member. */
-      source: { kind: "user" },
+      /* Not `user`. `MessageSourceMap` is closed in TypeScript only — the runtime
+       * admits any non-empty kind (and the format layer preserves it, refusing
+       * only the retired `plugin` wrapper), which is how `/goal` rounds and
+       * schedules carry their own. Chat keys its renderer on this field alone:
+       * `kind: "user"` draws an operator bubble, anything else draws the
+       * collapsed turn-trigger notice, so the pass stops looking typed.
+       * It also keeps `isSpeaker` from reading machine boilerplate as the
+       * operator's own words and spending a query slot on it. */
+      source: { kind: "prime-refine" },
     });
   } catch (error) {
     refining.delete(key);
+    /* Drop the waiter too, or an awaited invocation never settles and the
+     * command row shimmers forever. */
+    refineWaiters.delete(key);
     return { ok: false, error: (error && error.message) || String(error) };
   }
   return { ok: true };
+}
+
+/** Settle the pass queued for this key, if any. Safe to call when none is. */
+function releaseRefinement(key) {
+  refineTurns.delete(key);
+  const waiter = refineWaiters.get(key);
+  if (!waiter) return;
+  refineWaiters.delete(key);
+  waiter.resolve();
+}
+
+/**
+ * Resolve when the pass queued for this agent settles, so the command row can
+ * stay live until the work it started has actually run.
+ * @returns a promise, or undefined when no pass is queued.
+ */
+function passSettled(agent) {
+  const waiter = agent ? refineWaiters.get(scopeKey("session", agent)) : undefined;
+  return waiter ? waiter.promise : undefined;
+}
+
+/** The provider name the fork path needs; the preset mounts it as `subagent_fork`. */
+const FORK_PROVIDER = "fork";
+
+/** @returns the subagents service when this profile can run a forked pass. */
+function forkService(ctx) {
+  try {
+    const subagents = ctx.get ? ctx.get("subagents") : null;
+    if (!subagents || typeof subagents.startActivation !== "function") return null;
+    if (typeof subagents.getProvider === "function" && !subagents.getProvider(FORK_PROVIDER)) return null;
+    return subagents;
+  } catch { return null; }
+}
+
+/**
+ * Run one refinement pass as a forked subagent instead of an in-turn followup.
+ *
+ * The child is seeded with this session's completed-turn prefix, so it reads the
+ * same conversation at cached rates. `delivery: "caller"` is what makes this look
+ * like a built-in command: the child sends no `subagent-settled` message, so the
+ * parent opens no second turn and the only thing the operator sees is the
+ * command row it is already watching.
+ *
+ * The child's `harness_refine` writes land in THIS session's store, not the
+ * child's — `storeSessionId` resolves through the child header's `parentSession`.
+ * @returns a settled `CommandResult` for the command row.
+ */
+async function runForkedPass(ctx, agent, signal, scope) {
+  const subagents = forkService(ctx);
+  if (!subagents) return err("refine: the fork subagent provider is unavailable in this profile");
+  /* The fork does not open a turn, so the `turn/end` re-arm never fires for it —
+   * this guard is the ONLY thing that stops a second `/refine` stacking passes. */
+  const key = scopeKey("session", agent);
+  if (refining.has(key)) return err("refine: a refinement pass is already queued for this session");
+  refining.add(key);
+  /* Read the baseline BEFORE the child can write. A child that ends normally
+   * without recording anything is a success by `stopReason` and a lie by
+   * outcome; comparing snapshots is what makes the row report the difference. */
+  const before = loadSnapshots(scope, agent).length;
+  let receipt;
+  try {
+    receipt = await subagents.startActivation({
+      provider: FORK_PROVIDER,
+      /* Time-stamped so the subagent list reads as a pass history instead of N
+       * identical "prime refine" rows — the child is already cataloged there
+       * (catalog admission is unconditional; `delivery: "caller"` only
+       * suppresses the settlement message), so the label is the whole fix. */
+      label: "refine " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }),
+      request: {
+        parent: agent,
+        prompt: [{ type: "text", text: refinementPrompt("Refine the continual harness now: review this conversation and record what should outlive it.") }],
+      },
+      signal,
+      delivery: "caller",
+    });
+  } catch (error) {
+    refining.delete(key);
+    return err("refine: " + ((error && error.message) || String(error)));
+  }
+  try {
+    const terminal = await receipt.result;
+    if (terminal && terminal.stopReason === "error") return err("refine: the refinement subagent failed; nothing was recorded");
+    const after = loadSnapshots(scope, agent).length;
+    /* "Nothing durable" is a legitimate answer, not a failure — say which one
+     * happened instead of claiming a refinement that did not occur. */
+    if (after === before) return ok("the pass found nothing durable to record in the " + scope + " harness.");
+    return ok("refined the " + scope + " harness (" + (after - before) + " pass snapshot" + (after - before === 1 ? "" : "s") + " recorded).");
+  } catch (error) {
+    return err("refine: " + ((error && error.message) || String(error)));
+  } finally {
+    /* Release here, not on a turn boundary: a forked pass opens no turn, so
+     * nothing else would ever clear the slot. */
+    refining.delete(key);
+    try { receipt.dispose(); } catch { /* already disposed */ }
+  }
 }
 
 export function refine(rawInput, agent) {
@@ -828,11 +983,13 @@ export function refine(rawInput, agent) {
     resetPythonRepl(agent);
     return ok("reset persistent RLM Python REPL for this session");
   }
-  /* A bare `/refine` is the refinement pass itself, not a usage error. */
+  /* A bare `/refine` is the refinement pass itself, not a usage error. The
+   * handler awaits the pass through `passSettled()`; the result itself stays a
+   * plain `CommandResult`, because the registry validates that shape. */
   if (!body) {
     const queued = queueRefinement(agent, "Refine the continual harness now: review this conversation and record what should outlive it.");
     if (!queued.ok) return err("refine: " + queued.error);
-    return ok("refining the " + scope + " harness; the result lands in /refine --list.");
+    return ok("refining the " + scope + " harness.");
   }
   if (body === "--help") return err(USAGE);
   let cmdKind = "memory";
@@ -1603,59 +1760,6 @@ function withRawAsar(fn) {
   }
 }
 
-const promotedFullAccessSessions = new Set();
-export function ensurePrimeFullAccess(ctx, session, event) {
-  if (!session || typeof session.id !== "string") return false;
-  if (event && event.type === "agent-preset/selected" && event.data) {
-    if (event.data.agentPreset !== PRESET_ID) {
-      if (promotedFullAccessSessions.has(session.id)) {
-        promotedFullAccessSessions.delete(session.id);
-        try {
-          const perms = (ctx && ctx.permissionPresets) || (ctx && ctx.get && ctx.get("permissionPresets"));
-          const fallbackPreset = (perms && perms.defaultPreset) || "workspace-write";
-          if (perms && typeof perms.set === "function") perms.set(session, fallbackPreset);
-          else if (typeof session.append === "function") {
-            session.append("permission/preset", { preset: fallbackPreset });
-            session.append("sandbox/mode", { mode: fallbackPreset === "danger-full-access" ? "danger-full-access" : "workspace-write" });
-          }
-        } catch {}
-      }
-      return false;
-    }
-  }
-  if (promotedFullAccessSessions.has(session.id)) return false;
-  let resolvedPreset = null;
-  if (event && event.type === "agent-preset/selected" && event.data) {
-    resolvedPreset = event.data.agentPreset;
-  } else if (session.header && session.header.agentPreset) {
-    resolvedPreset = session.header.agentPreset;
-  } else {
-    resolvedPreset = presetOf(ctx, null, session);
-    if (!resolvedPreset) {
-      try {
-        const presets = (ctx && ctx.agentPresets) || (ctx && ctx.get && ctx.get("agentPresets"));
-        if (presets && typeof presets.defaultId === "string") resolvedPreset = presets.defaultId;
-      } catch {}
-    }
-  }
-  if (resolvedPreset !== PRESET_ID) return false;
-  promotedFullAccessSessions.add(session.id);
-  try {
-    const perms = (ctx && ctx.permissionPresets) || (ctx && ctx.get && ctx.get("permissionPresets"));
-    if (perms && typeof perms.set === "function") {
-      perms.set(session, "danger-full-access");
-      return true;
-    }
-    if (typeof session.append === "function") {
-      session.append("permission/preset", { preset: "danger-full-access" });
-      session.append("sandbox/mode", { mode: "danger-full-access" });
-      session.append("approval/policy", { policy: "never" });
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
 let windowsSandboxPatched = false;
 export function ensureWindowsSandboxRunner(ctx) {
   if (process.platform !== "win32") return false;
@@ -1750,17 +1854,39 @@ export function apply(ctx, config) {
   ctx.commands.register({
     name: "refine",
     description: "Record a durable finding in the prime continual harness (scoped session|workspace).",
-    handler: (invocation) => refine(invocation && invocation.rawInput, invocation && invocation.agent),
+    /* A refinement pass outlives the invocation: the row stays live (and
+     * shimmering) until the turn it started settles, then settles once with
+     * `command/done`. Every other branch returns a plain result and settles
+     * immediately. The started pass appends `command/run` before this handler
+     * runs, so the shimmer begins at once rather than only after the turn. */
+    handler: (invocation) => {
+      const agent = invocation && invocation.agent;
+      const rawInput = invocation && invocation.rawInput;
+      /* Only a bare `/refine` is a pass, and only a pass can be forked. Flag
+       * queries (`--list`, `--diff`, …) stay synchronous and local, and so does
+       * `/refine global` — it parses to an empty body but is a removed-scope
+       * error, not a pass. */
+      const parsed = parseRefine(rawInput);
+      if (parsed.body === "" && parsed.removed === null && agent && forkService(ctx)) {
+        /* The fork path: one row, shimmering until the child settles, and no
+         * second turn because the child delivers to its caller. */
+        return runForkedPass(ctx, agent, invocation.signal, parsed.scope);
+      }
+      /* Compare identity across the call: `/refine --list` while a pass is in
+       * flight must NOT park on that pass. Only a waiter this invocation created
+       * is the one to await. */
+      const before = passSettled(agent);
+      const result = refine(rawInput, agent);
+      const after = passSettled(agent);
+      /* `dsh-commands` awaits `Promise.resolve(output)` either way, so returning
+       * the bare result for every non-pass branch costs nothing and keeps when
+       * the row settles obvious. */
+      return after && after !== before ? after.then(() => result) : result;
+    },
   });
 
   /* Compaction survival: entries are on disk; this re-injects + offers auto-refine. */
   try { goalsApi = ctx.get ? ctx.get("goals") : null; } catch { goalsApi = null; }
-
-  ctx.on("session/created", (session) => {
-    Promise.resolve().then(() => {
-      try { ensurePrimeFullAccess(ctx, session, null); } catch {}
-    });
-  });
 
   ctx.on("session/event", (session, event) => {
     if (!session) return;
@@ -1768,8 +1894,15 @@ export function apply(ctx, config) {
      * name the folder it is showing instead of guessing from the process cwd. */
     rememberSession(session);
     if (!windowsSandboxPatched) ensureWindowsSandboxRunner(ctx);
-    try { ensurePrimeFullAccess(ctx, session, event); } catch {}
     if (!event) return;
+    /* Bind a pass to the exact turn it opens. The first `turn/start` after the
+     * message was queued is that turn: `followup` either wakes the driver with
+     * it or parks it as the next turn, and nothing else may interleave. */
+    if (event.type === "turn/start") {
+      const key = scopeKey("session", { session });
+      if (refining.has(key) && !refineTurns.has(key)) refineTurns.set(key, event.data && event.data.turn);
+      return;
+    }
     /* The pass is over once its turn ends, which re-arms `/refine`. Re-arming on
      * `turn/start` would clear the slot before the pass had even run. */
     if (event.type === "turn/end") {
@@ -1782,7 +1915,14 @@ export function apply(ctx, config) {
           for (const [k, n] of settledTurns) if (n === 0) settledTurns.delete(k);
         }
       }
+      const passTurn = refineTurns.get(key);
+      const endedTurn = event.data && event.data.turn;
+      const isPass = refining.has(key) && (passTurn === undefined || passTurn === endedTurn);
       refining.delete(key);
+      /* A pass waiting on its turn to begin is NOT released by an operator turn
+       * ending — that would settle the row before the work ran. A pass whose turn
+       * was never bound is released, or a cancelled start would shimmer forever. */
+      if (isPass) releaseRefinement(key);
       return;
     }
     if (event.type !== "compaction/end") return;

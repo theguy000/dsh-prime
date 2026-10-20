@@ -87,7 +87,15 @@ const CSS = [
 ".dp-count-pos{opacity:.95;background:rgba(59,130,246,0.14);color:#60a5fa;font-weight:500}",
 ".dp-pre{margin:0;padding:8px 10px;border-radius:6px;background:rgba(0,0,0,0.2);border:1px solid var(--dsh-border,rgba(127,127,127,0.2));font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;white-space:pre-wrap;word-break:break-word;max-height:160px;overflow:auto}",
 ".dp-alert{margin:0;padding:8px 12px;border-radius:8px;background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);color:#f87171;font-size:12px}",
-".dp-empty{opacity:.5;font-size:12px;margin:2px 0}"
+".dp-empty{opacity:.5;font-size:12px;margin:2px 0}",
+/* The refine row reuses the built-in card's structure, so these mirror
+ * GenericCommandCard.module.css rather than inventing a look. */
+".dp-refine-row{flex-direction:column;display:flex}",
+".dp-refine-sep{background:var(--dsw-alias-label-caption);border-radius:1px;flex:none;width:2px;height:2px;margin:0 8px}",
+".dp-refine-summary{min-width:0;font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(24px + var(--dsh-content-font-delta,0px));text-overflow:ellipsis;white-space:nowrap;flex:auto;overflow:hidden}",
+".dp-refine-summary[data-error],.dp-refine-body[data-error]{color:var(--dsw-alias-state-error-primary)}",
+".dp-refine-body{border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-lg);background:var(--dsw-alias-markdown-code-block);max-height:260px;color:var(--dsw-alias-label-primary);font:var(--dsw-font-markdown-code-block-small);white-space:pre-wrap;margin:4px 0 4px 4px;padding:12px 16px;overflow:auto}",
+".dp-visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}"
 ].join("");
 
 function ensureCss() {
@@ -697,6 +705,53 @@ state.loading
 const name = NS;
 const inject = ["slots"];
 
+/* The `refine` command's own row.
+ *
+ * Built-in commands render through `GenericCommandCard`, which hardcodes
+ * `t("command.running")` for the running label. That label cannot be changed
+ * from a plugin: `runningSummary` is a prop only the internal compaction card
+ * receives, and `locale.register` throws on a duplicate namespace+locale, so
+ * `chat`/`en` cannot be extended. A keyed `commandview` entry is the supported
+ * way to own one command's row, which is exactly how `/compact` gets its card.
+ *
+ * The primitives are the same ones the built-in card uses (DisclosureRow +
+ * TextShimmer + the command icon), so the row looks and shimmers identically —
+ * only the four words differ. */
+const RefineIcon = primitives.IconApiOutlineRegular;
+const TextShimmer = primitives.TextShimmer;
+const DisclosureRow = primitives.DisclosureRow;
+
+function RefineCommandRow({ node }) {
+const [expanded, setExpanded] = React.useState(false);
+const text = node.outcome ? node.outcome.text : undefined;
+const state = node.outcome === null ? "running" : node.outcome.kind === "error" ? "error" : "ok";
+const running = state === "running";
+const summary = running ? "Refining…" : text !== undefined ? text : state === "error" ? "Failed" : "Done";
+const body = text !== undefined && text.includes("\n") ? text : null;
+const open = expanded && body !== null;
+const toggle = React.useCallback(() => setExpanded((v) => !v), []);
+return h("div", { className: "dp-refine-row", "data-state": state },
+running ? h("span", { className: "dp-visually-hidden" }, "Refining the harness") : null,
+h(DisclosureRow, {
+icon: h(RefineIcon, { size: 14 }),
+title: node.name || "refine",
+running,
+open,
+expandable: body !== null,
+expandOnRowClick: true,
+keepContentWhenOpen: true,
+onToggle: toggle,
+collapsedContent: h(React.Fragment, null,
+h("span", { className: "dp-refine-sep", "data-shimmer-decoration": true, "aria-hidden": true }),
+h("span", { className: "dp-refine-summary", "data-error": state === "error" || undefined },
+h(TextShimmer, null, summary)
+)
+),
+children: open ? h("pre", { className: "dp-refine-body", "data-error": state === "error" || undefined }, body) : undefined
+})
+);
+}
+
 function apply(ctx) {
 ctx.effect(() => {
 ensureCss();
@@ -712,6 +767,11 @@ id: NS,
 order: 65,
 label: () => "Prime Harness"
 }, () => h(PrimeHarnessSection, null)));
+ctx.slots.inject("conversation.chat.commandview", () => ctx.slots.register({
+name: "conversation.chat.commandview",
+id: NS + ":refine",
+key: "refine"
+}, RefineCommandRow));
 }
 
 exports.name = name;

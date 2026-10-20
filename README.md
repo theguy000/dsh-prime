@@ -76,6 +76,50 @@ conversation and records what should outlive it. `/refine <note>` records a
 note directly. Entries live on disk, so they outlive compaction by
 construction, and the prompt section is re-rendered on every assembly.
 
+**A pass behaves like a built-in command.** A bare `/refine` runs the pass as a
+**forked subagent** with `delivery: "caller"`: the child is seeded with this
+session's completed-turn prefix, so it reads the same conversation at cached
+rates, and it sends no `subagent-settled` message, so the parent opens no second
+turn. The `command/run` row shimmers for the whole pass and settles once with
+`command/done` — the `/compact` shape, with no turn, thinking block, or tool call
+between the command and its result.
+
+**The running label says "Refining…".** `GenericCommandCard` hardcodes
+`t("command.running")`, and neither escape hatch is open to a plugin: the
+`runningSummary` prop reaches only the internal compaction card, and
+`locale.register` rejects a second `chat`/`en` dictionary. So `client.js`
+registers a keyed `conversation.chat.commandview` entry for `refine` — the same
+supported mechanism `/compact` uses — rendering the identical structure from the
+identical primitives (`DisclosureRow` + `TextShimmer` + `IconApiOutlineRegular`).
+The row looks and shimmers exactly like the built-in one; only the words differ.
+
+**Each pass is its own row in the subagent list.** `startActivation` catalogs the
+child unconditionally — `delivery: "caller"` suppresses the settlement *message*,
+not the catalog entry — so passes are already visible there. The label carries
+the time, making that list a pass history:
+
+**The row reports what actually happened, not that the child returned.** A child
+that ends normally without recording anything is a success by `stopReason` and a
+lie by outcome, so the handler compares the store's snapshot count before and
+after the child runs and says either `refined … (N pass snapshots recorded)` or
+`the pass found nothing durable to record`. Nothing durable is a legitimate
+answer; claiming a refinement that did not occur is not.
+
+The child's `harness_refine` writes land in the **parent's** store, not the
+child's: a delegated child's session header records `parentSession`, and
+`storeSessionId` follows it back. Without that, every finding landed in a file
+nobody reads — a silent loss, because the write itself succeeds.
+
+Two paths stay in-process. Flag queries (`--list`, `--diff`, `--snapshots`, …)
+never start an agent at all. The post-compaction hook keeps its own in-turn
+pass, because a fork's seed stops at the last `turn/end` and that hook fires
+immediately after a compaction replaces the surface. That in-turn pass carries
+`source: { kind: "prime-refine" }`, not `user`, so Chat draws the collapsed
+turn-trigger notice rather than an operator bubble, and `isSpeaker` stops reading
+the pass's boilerplate as the operator's own words. It is also bound to the exact
+turn it opens, so an operator turn settling while it is still queued cannot
+settle the row early.
+
 The agent writes through the `harness_refine` tool (or `rlm.harness.*` inside
 `python_repl`), never the slash command ? a slash command is operator-only, so
 the triggers below all name the tool.

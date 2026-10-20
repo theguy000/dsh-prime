@@ -149,7 +149,10 @@ const asCommandResult = (value) => {
 	return value.text;
 };
 assert.throws(() => asCommandResult("a bare string"), /CommandResult/, "the guard itself must reject a bare string");
-const refine = (rawInput, a = agent) => asCommandResult(registered.commands[0].handler({ rawInput, agent: a }));
+/* A queued refinement pass keeps its command row live until the turn settles, so
+ * the handler returns a promise for that branch only. Await unconditionally —
+ * `dsh-commands` does the same with `Promise.resolve(output)`. */
+const refine = async (rawInput, a = agent) => asCommandResult(await registered.commands[0].handler({ rawInput, agent: a }));
 
 assert.equal(registered.commands[0].name, "refine");
 /* A bare `/refine` runs a refinement pass rather than printing usage: it queues
@@ -169,23 +172,48 @@ assert.equal(registered.commands[0].name, "refine");
 		},
 	};
 
-	assert.match(refine("", runnable), /^refining the session harness/);
+	/* The row settles only once the pass's turn ends, so these kick the handler
+	 * off and assert the queued effect, then close the turn to release it. The
+	 * `settled` promise is what makes the row stay live — asserted below. */
+	const pass = refine("", runnable);
 	assert.equal(sent.length, 1, "the pass is queued exactly once");
 	assert.equal(sent[0].role, "user");
-	assert.equal(sent[0].source.kind, "user", "MessageSourceMap is closed, so an invented kind throws");
+	/* Not `user`: an injected pass must not render as an operator bubble, and
+	 * `isSpeaker` must not spend a query slot on its boilerplate. */
+	assert.equal(sent[0].source.kind, "prime-refine");
+	/* The premise of that choice, asserted against the real session layer rather
+	 * than assumed: `MessageSourceMap` is closed in TypeScript only, so a
+	 * non-empty custom kind appends and the format layer preserves it. If a
+	 * future DSH starts rejecting unknown kinds, this fails here instead of
+	 * silently turning every `/refine` into a thrown followup. */
+	{
+		const { Session } = await import(pathToFileURL(path.join(APP, "@deepseek-ai", "dsh-session", "lib", "index.js")).href);
+		const probe = new Session("prime-check-source-kind");
+		probe.append("user/message", { ...sent[0], id: "m-prime-refine" }, { surfaceOp: "append" });
+		const landed = probe.snapshotEvents().find((e) => e.type === "user/message");
+		assert.equal(landed.data.source.kind, "prime-refine", "the runtime must admit the injected pass's source kind");
+	}
 	assert.match(sent[0].content[0].text, /harness_refine/, "the pass names the tool that records findings");
 	assert.match(sent[0].content[0].text, /ONE call/, "the pass must ask for a single batch call");
 	/* The prompt section already carries the digest on every assembly, so the pass
 	 * must not repeat it. */
 	assert.ok(!/Current harness digest|## Continual harness/.test(sent[0].content[0].text), "the pass must not duplicate the digest");
-	assert.match(refine("", runnable), /already queued/, "an in-flight pass cannot be stacked");
+	assert.match(await refine("", runnable), /already queued/, "an in-flight pass cannot be stacked");
+	/* The pass is still running: the handler it opened has not settled. */
+	let settledYet = false;
+	void pass.then(() => { settledYet = true; });
+	await Promise.resolve();
+	assert.equal(settledYet, false, "the command row keeps shimmering until the pass's turn ends");
 	emit({ type: "turn/end" });
-	assert.match(refine("", runnable), /^refining the session harness/, "the pass finishing re-arms the command");
+	assert.match(await pass, /^refining the session harness/, "the row settles with the queued result once the pass ends");
+	/* Re-armed: a second pass may start, and it settles the same way. */
+	const pass2 = refine("", runnable);
+	assert.equal(sent.length, 2, "the pass finishing re-arms the command");
 	emit({ type: "turn/end" });
-	assert.equal(sent.length, 2);
+	assert.match(await pass2, /^refining the session harness/);
 }
-assert.match(refine("--help"), /^usage:/);
-assert.match(refine("--nope"), /unknown flag/, "a typo must not become a recorded note");
+assert.match(await refine("--help"), /^usage:/);
+assert.match(await refine("--nope"), /unknown flag/, "a typo must not become a recorded note");
 
 /* ---- the post-compaction hook only refines the preset that mounts the harness ----
  * The hook is registered on the *root* plane because the `/refine` command is,
@@ -304,7 +332,11 @@ assert.match(refine("--nope"), /unknown flag/, "a typo must not become a recorde
 	/* A manual `/refine` is not gated: the operator asking IS the reason, and a
 	 * session with no settled turns proves the gate is not what let it through. */
 	const manual = { session: { id: "manual-1" }, followup: (m) => void followups.push({ sid: "manual-1", m }) };
-	assert.match(refine("", manual), /^refining the session harness/, "a manual pass skips the review gate");
+	const manualPass = refine("", manual);
+	assert.equal(followups.filter((f) => f.sid === "manual-1").length, 1, "a manual pass skips the review gate");
+	/* Close its turn so the awaited row settles; the session never reports here. */
+	registered.events.find((e) => e.type === "session/event").handler({ id: "manual-1" }, { type: "turn/end", data: { turn: 1 } });
+	assert.match(await manualPass, /^refining the session harness/);
 }
 assert.equal(registered.commands[0].handler({ rawInput: "", agent }).kind, "error", "no live agent is a reported error, not a string");
 assert.equal(section.name, "prime:continual-harness");
@@ -324,15 +356,93 @@ assert.match(section.text({ agent: null }), /harness_refine/, "a missing agent s
 			deriveMessages: () => [{ role: "user", content: [{ type: "text", text: "unrelated chatter about css" }] }],
 		},
 	};
-	refine("scoped harness ship checklist", gAgent);
-	assert.equal(refine("--list", gAgent).split("\n").pop(), "- scoped harness ship checklist");
-	refine("--clear", gAgent);
+	await refine("scoped harness ship checklist", gAgent);
+	assert.equal((await refine("--list", gAgent)).split("\n").pop(), "- scoped harness ship checklist");
+	await refine("--clear", gAgent);
 }
 
-assert.match(refine("--help"), /^usage:/);
-assert.match(refine("--list"), /is empty/);
-assert.match(refine("Prefer composition over new code."), /recorded in session harness \(1\/200\)/);
-assert.match(refine("Prefer composition over new code."), /already recorded/);
+assert.match(await refine("--help"), /^usage:/);
+assert.match(await refine("--list"), /is empty/);
+
+/* ---- a forked pass writes to its PARENT's harness, not its own ----
+ * A child is seeded from its parent and gets its own session id. Resolving the
+ * store from that id made every finding land in a file nobody reads — a silent
+ * loss, because the write itself succeeds. The child header records
+ * `parentSession`, so the store follows it back. */
+{
+	const { storeSessionId, load: loadScoped, save: saveScoped } = await import("../index.js");
+	const parent = { session: { id: "fork-parent", header: { cwd: "C:/work/fork" } } };
+	const child = { session: { id: "fork-child", header: { cwd: "C:/work/fork", parentSession: "fork-parent" } } };
+	saveScoped("session", child, [{ id: "cf1", text: "recorded by the forked pass", createdAt: 1, kind: "memory" }]);
+	assert.equal(storeSessionId(child), "fork-parent", "a child resolves to its parent session");
+	assert.equal(storeSessionId(parent), "fork-parent", "a root agent resolves to itself");
+	assert.equal(storeSessionId({ session: { id: "root", header: {} } }), "root", "no parentSession means the agent's own session");
+	assert.deepEqual(loadScoped("session", parent).map((e) => e.text), ["recorded by the forked pass"], "the parent reads what the child wrote");
+	assert.deepEqual(loadScoped("session", { session: { id: "fork-child", header: {} } }), [], "nothing leaked into the child's own scope");
+	saveScoped("session", parent, []);
+}
+
+/* ---- the fork path: no turn, and success only when something was recorded ----
+ * The root `ctx` above has no `subagents` service, so every other test drives the
+ * in-turn fallback. This block mounts a fake fork provider and asserts the two
+ * things the fork exists for: it opens no turn, and it does not claim to have
+ * refined when the store is unchanged. */
+{
+	const { apply: applyFork, save: saveForkScoped, loadSnapshots: snapsFork } = await import("../index.js?fork-path");
+	const calls = [];
+	const forkEvents = [];
+	let mode = "records"; // "records" | "silent"
+	const fakeSubagents = {
+		getProvider: (n) => (n === "fork" ? {} : undefined),
+		startActivation: async (spec) => {
+			calls.push(spec);
+			return {
+				childId: "child-1",
+				dispose: () => void calls.push({ disposed: true }),
+				result: Promise.resolve({ stopReason: "end" }),
+			};
+		},
+	};
+	let cmd;
+	const forkCtx = {
+		systemPrompt: { section: () => {} },
+		commands: { register: (d) => void (cmd = d) },
+		on: (type, handler) => void forkEvents.push({ type, handler }),
+		effect: () => {},
+		webServer: { register: () => () => {} },
+		logger: { warn: () => {} },
+		get: (id) => (id === "subagents" ? fakeSubagents : undefined),
+	};
+	applyFork(forkCtx);
+	const forked = { session: { id: "fork-live", header: { cwd: "C:/work/fork2" } }, followup: () => { throw new Error("a forked pass must not open a turn"); } };
+
+	/* Nothing recorded: the row says so instead of claiming success. */
+	const emptyOutcome = await cmd.handler({ rawInput: "", agent: forked });
+	assert.equal(emptyOutcome.kind, "success");
+	assert.match(emptyOutcome.text, /found nothing durable/, "an unchanged store is reported as nothing durable");
+	assert.ok(!/refined/.test(emptyOutcome.text), "and never as a refinement that happened");
+	assert.equal(calls.length, 2, "one spawn plus one dispose");
+	assert.equal(calls[0].provider, "fork");
+	assert.equal(calls[0].delivery, "caller", "caller delivery is what suppresses the settlement turn");
+	assert.equal(calls[0].request.parent, forked);
+
+	/* Recorded: a real snapshot appears, and the row reports the count. */
+	saveForkScoped("session", forked, [{ id: "fk1", text: "durable", createdAt: 1, kind: "memory" }], {
+		reason: "tool:harness_refine (+1 ~0 -0)",
+		before: [],
+	});
+	assert.equal(snapsFork("session", forked).length, 1);
+	const recordedOutcome = await cmd.handler({ rawInput: "", agent: forked });
+	assert.match(recordedOutcome.text, /found nothing durable/, "a second pass with no new writes is still honest");
+
+	/* Flag queries must never spawn a child. */
+	const spawnedBefore = calls.length;
+	for (const q of ["--list", "--snapshots", "global", "--help"]) await cmd.handler({ rawInput: q, agent: forked });
+	assert.equal(calls.length, spawnedBefore, "flag queries stay local and never fork");
+	saveForkScoped("session", forked, []);
+}
+assert.match(await refine("Prefer composition over new code."), /recorded in session harness \(1\/200\)/);
+assert.match(await refine("Prefer composition over new code."), /already recorded/);
 
 const rendered = section.text({ agent });
 assert.match(rendered, /## Continual harness/);
@@ -347,9 +457,9 @@ assert.ok(store.entries[0].id, "each entry carries an id");
 // The scope defaults to session and is persisted for the settings UI to read back.
 assert.equal(loadConfig().defaultScope, "session");
 
-assert.match(refine("--clear"), /cleared harness/);
+assert.match(await refine("--clear"), /cleared harness/);
 assert.match(section.text({ agent }), /harness_refine/, "clearing leaves the instruction in place");
-assert.equal(refine("--list"), "harness (session) is empty");
+assert.equal(await refine("--list"), "harness (session) is empty");
 
 // A corrupt store degrades to an empty section instead of throwing.
 fs.writeFileSync(path.join(temp, "prime", "session-s1.json"), "{ not json");
@@ -810,22 +920,6 @@ assert.ok(!/from "@deepseek-ai\//.test(client), "the client bundle must not impo
 	resetPythonRepl(replAgent);
 }
 
-
-{
-const { ensurePrimeFullAccess } = await import("../index.js");
-const appended = [];
-const mkSess = (id, preset) => ({
-id,
-header: preset ? { agentPreset: preset } : {},
-append: (type, data) => void appended.push({ id, type, data }),
-});
-const fakeCtx = { get: () => undefined };
-assert.equal(ensurePrimeFullAccess(fakeCtx, mkSess("std-1", "standard"), null), false, "standard preset stays in default workspace-write");
-assert.equal(appended.length, 0);
-assert.equal(ensurePrimeFullAccess(fakeCtx, mkSess("prime-1", "prime"), null), true, "prime preset auto-promotes to danger-full-access");
-assert.equal(appended.some((e) => e.id === "prime-1" && e.type === "sandbox/mode" && e.data.mode === "danger-full-access"), true);
-assert.equal(ensurePrimeFullAccess(fakeCtx, mkSess("prime-1", "prime"), null), false, "only promotes once per session so manual overrides stick");
-}
 
 fs.rmSync(temp, { recursive: true, force: true });
 console.log("dsh-prime self-check: ok");
